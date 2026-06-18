@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      0.1.0
+// @version      0.1.1
 // @description  Metadata scraper for Komga comics server - 从外部数据源获取漫画/书籍元数据
 // @author       You
 // @match        http://192.168.0.204:25600/*
@@ -47,10 +47,6 @@
                 token: ''
             }
         },
-        proxy: {
-            enabled: false,
-            url: ''
-        },
         rateLimit: {
             enabled: true,
             minInterval: 2000
@@ -91,52 +87,6 @@
             config.version = SCRIPT_VERSION;
             saveConfig(config);
         }
-    }
-
-    function normalizeProxyUrl(raw) {
-        if (!raw) return '';
-        let url = String(raw).trim();
-        if (!url) return '';
-
-        // 去除末尾多余的斜杠、空白
-        url = url.replace(/\/+$/, '').trim();
-
-        // 如果缺少协议，默认补 http://
-        if (!/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\//.test(url)) {
-            // 纯 "host:port" 形式
-            if (/^[^\s:\/]+:\d+$/.test(url)) {
-                url = 'http://' + url;
-            } else if (/^\d{1,3}(\.\d{1,3}){3}(:\d+)?$/.test(url) || /^localhost(:\d+)?$/.test(url)) {
-                // 纯 IP 或 localhost（可能带端口）
-                if (!/:\d+$/.test(url)) url = url + ':7890';
-                url = 'http://' + url;
-            }
-        }
-
-        // 校验最终格式：scheme://host:port
-        if (!/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/[^\s:\/]+:\d+(\/)?$/.test(url)) {
-            // 对于 "http://host" 这种缺少端口的格式，补充常见端口
-            if (/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/[^\s:\/]+(\/)?$/.test(url)) {
-                url = url.replace(/\/+$/, '') + ':7890';
-            }
-        }
-
-        return url;
-    }
-
-    function validateProxyUrl(raw) {
-        const url = normalizeProxyUrl(raw);
-        if (!url) return { valid: false, reason: '代理地址为空' };
-        if (!/^[a-zA-Z][a-zA-Z0-9+\-.]*:\/\/[^\s:\/]+:\d+(\/)?$/.test(url)) {
-            return { valid: false, reason: '代理地址格式不正确，应为 scheme://host:port（例如 http://127.0.0.1:7890）' };
-        }
-        const schemeMatch = url.match(/^([a-zA-Z][a-zA-Z0-9+\-.]*):\/\//);
-        const scheme = schemeMatch ? schemeMatch[1].toLowerCase() : '';
-        const allowed = ['http', 'https', 'socks', 'socks4', 'socks4a', 'socks5', 'socks5h'];
-        if (allowed.indexOf(scheme) === -1) {
-            return { valid: false, reason: '不支持的代理协议: ' + scheme + '（仅支持 http/https/socks 系列）' };
-        }
-        return { valid: true, url: url, scheme: scheme };
     }
 
     // ============================================================
@@ -212,14 +162,14 @@
     const rateLimiter = new RateLimiter();
 
     // ============================================================
-    // 4. 代理请求模块
+    // 4. 请求模块
     // ============================================================
 
     /**
-     * 判断是否为本地/内网请求（这些请求不应该使用代理，且需要认证 Cookie）
+     * 判断是否为本地/内网请求（这些请求需要携带认证 Cookie）
      */
     function isLocalRequest(url) {
-        // 本地/内网地址不使用代理
+        // 本地/内网地址模式
         const localPatterns = [
             'localhost',
             '127.0.0.1',
@@ -253,7 +203,7 @@
     }
 
     /**
-     * 核心请求函数 - 智能判断是否使用代理和认证
+     * 核心请求函数 - 智能判断请求类型，正确处理 Cookie
      */
     function doGMRequest(options) {
         return new Promise((resolve, reject) => {
@@ -341,42 +291,15 @@
                 }
             }
 
-            // 关键修复: 仅对外部请求使用代理，本地请求不使用代理
-            let proxyUrl = '';
-            let proxyValid = false;
-            if (!isLocal && config.proxy.enabled && config.proxy.url) {
-                const check = validateProxyUrl(config.proxy.url);
-                if (check.valid) {
-                    proxyUrl = check.url;
-                    proxyValid = true;
-                    gmOptions.proxy = proxyUrl;
-                    // 注意：fetch 模式下 proxy 可能不生效，需回退到 xhr 模式
-                    delete gmOptions.fetch;
-                    if (debug) console.log('[KomgaScraper] 使用代理（' + check.scheme + '）: ' + proxyUrl + ' (已切换到 XHR 模式)');
-                } else {
-                    console.warn('[KomgaScraper] 代理地址无效，将跳过代理直连: ' + check.reason);
-                    if (debug) console.log('[KomgaScraper] 原始代理地址: "' + config.proxy.url + '"');
-                }
-            } else if (isLocal) {
-                if (debug) console.log('[KomgaScraper] 本地请求 - 已禁用代理');
-            }
-
             if (debug) {
-                const logOptions = Object.assign({}, gmOptions);
-                if (logOptions.proxy) {
-                    logOptions.proxy = '[PROXY: ' + proxyUrl + ']';
-                }
-                console.log('[KomgaScraper] GM_xmlhttpRequest options:', JSON.stringify(logOptions, null, 2));
+                console.log('[KomgaScraper] GM_xmlhttpRequest options:', JSON.stringify(gmOptions, null, 2));
             }
 
             try {
                 GM_xmlhttpRequest(gmOptions);
             } catch (e) {
                 console.error('[KomgaScraper] Failed to invoke GM_xmlhttpRequest:', e);
-                let msg = 'GM_xmlhttpRequest 调用失败';
-                if (e && e.message) msg = e.message;
-                if (proxyUrl) msg += '（请检查代理地址: ' + proxyUrl + '）';
-                reject(new Error(msg));
+                reject(e);
             }
         });
     }
@@ -386,98 +309,7 @@
      * 特别对本地请求更可靠，因为会自动携带 Cookie
      */
     async function fetchWithBackup(options) {
-        try {
-            return await doGMRequest(options);
-        } catch (error) {
-            console.warn('[KomgaScraper] GM_xmlhttpRequest failed, trying backup fetch:', error);
-
-            const config = getConfig();
-            const debug = config.debug;
-            const isLocal = isLocalRequest(options.url);
-
-            // 对于外部请求，backup fetch 无法使用用户脚本代理
-            // 如果用户启用了代理但 GM_xmlhttpRequest 失败，直接给出诊断错误
-            if (!isLocal && config.proxy.enabled && config.proxy.url) {
-                const check = validateProxyUrl(config.proxy.url);
-                const diagnosis = [];
-                diagnosis.push('GM_xmlhttpRequest 通过代理失败，backup fetch 因无法使用代理也会失败。');
-                if (!check.valid) {
-                    diagnosis.push('代理地址格式错误: ' + check.reason);
-                    diagnosis.push('请在设置面板中将代理地址修改为: http://127.0.0.1:7890 或 socks5://127.0.0.1:1080');
-                } else {
-                    diagnosis.push('代理地址: ' + check.url + '（' + check.scheme + '）');
-                    diagnosis.push('可能原因：');
-                    diagnosis.push('  1. 代理软件未启动或未在指定端口监听');
-                    diagnosis.push('  2. 代理软件需要开启"允许来自局域网的连接"');
-                    diagnosis.push('  3. 防火墙/杀毒软件阻止了连接');
-                    diagnosis.push('  4. api.bgm.tv 当前无法从当前网络访问');
-                    diagnosis.push('建议：在浏览器直接访问 https://api.bgm.tv/v0/search/subject/test?type=1 测试网络连通性');
-                }
-                const finalError = new Error('代理请求失败。' + diagnosis.join(' | '));
-                console.error('[KomgaScraper] ' + finalError.message);
-                throw finalError;
-            }
-
-            try {
-                const headers = new Headers();
-                if (options.headers) {
-                    Object.keys(options.headers).forEach(key => {
-                        headers.append(key, options.headers[key]);
-                    });
-                }
-
-                const fetchOptions = {
-                    method: options.method || 'GET',
-                    headers: headers,
-                    mode: isLocal ? 'same-origin' : 'cors',
-                    credentials: isLocal ? 'include' : 'omit'
-                };
-
-                if (options.data) {
-                    fetchOptions.body = typeof options.data === 'string' ? options.data : JSON.stringify(options.data);
-                }
-
-                // 添加超时控制（backup fetch 也不应长时间挂起）
-                const backupTimeout = options.timeout || 15000;
-                const controller = new AbortController();
-                const timer = setTimeout(function() { controller.abort(); }, backupTimeout);
-                fetchOptions.signal = controller.signal;
-
-                if (debug) {
-                    console.log('[KomgaScraper] Backup fetch mode:', isLocal ? 'same-origin (with credentials)' : 'cors',
-                               'timeout:', backupTimeout + 'ms', 'URL:', options.url);
-                }
-
-                const response = await fetch(options.url, fetchOptions);
-                clearTimeout(timer);
-                const text = await response.text();
-                let data = null;
-                try {
-                    data = text ? JSON.parse(text) : null;
-                } catch (e) {
-                    console.log('[KomgaScraper] Backup fetch parse failed');
-                }
-
-                return {
-                    status: response.status,
-                    statusText: response.statusText,
-                    data: data,
-                    raw: text
-                };
-            } catch (fetchError) {
-                console.error('[KomgaScraper] Backup fetch also failed:', fetchError);
-                let msg = '网络请求失败';
-                if (fetchError && fetchError.name === 'AbortError') {
-                    msg = '请求超时（' + ((options.timeout || 15000) / 1000) + 's），请检查网络连接';
-                } else if (fetchError && fetchError.message) {
-                    msg = fetchError.message;
-                }
-                if (!isLocal) {
-                    msg += '（建议：配置本地代理后再试，或检查 @connect 列表是否包含目标域名）';
-                }
-                throw new Error(msg);
-            }
-        }
+        return await doGMRequest(options);
     }
 
     async function fetchWithRateLimit(options) {
@@ -657,7 +489,7 @@
                 // 如果 status 为 0，说明请求被 CORS 阻止
                 if (response.status === 0) {
                     console.warn('[KomgaScraper] [Bangumi] Status 0 detected - request was blocked by CORS');
-                    throw new Error('请求被阻止，请检查代理设置或浏览器权限');
+                    throw new Error('请求被阻止，请检查网络或浏览器权限');
                 }
                 return [];
             }
@@ -1180,18 +1012,7 @@
 
         let settingsHtml = '<div style="padding:4px 0;">';
 
-        const safeProxyUrl = String(config.proxy.url || '').replace(/"/g, '&quot;');
-
         settingsHtml += `
-            <div style="margin-bottom:20px;">
-                <label style="color:#fff;font-size:14px;display:block;margin-bottom:8px;">🪪 代理设置 (国内用户访问 Bangumi 必需)</label>
-                <input type="text" id="ks-setting-proxy-url" value="${safeProxyUrl}" placeholder="http://127.0.0.1:7890" style="width:calc(100% - 16px);padding:10px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;margin-bottom:10px;font-family:inherit;">
-                <div style="display:flex;align-items:center;gap:8px;cursor:pointer;">
-                    <input type="checkbox" id="ks-setting-proxy-enabled" ${config.proxy.enabled ? 'checked' : ''} style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
-                    <label for="ks-setting-proxy-enabled" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">启用代理服务器</label>
-                </div>
-                <div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:6px;line-height:1.5;">代理地址格式: http://IP:端口 或 socks5://IP:端口<br>常用本地代理端口: Clash/V2Ray: 7890, 7891</div>
-            </div>
 
             <div style="margin-bottom:20px;">
                 <label style="color:#fff;font-size:14px;display:block;margin-bottom:8px;">⏱️ 请求频率限制</label>
@@ -1207,17 +1028,6 @@
                     <input type="checkbox" id="ks-setting-debug" ${config.debug ? 'checked' : ''} style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
                     <label for="ks-setting-debug" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">启用调试日志 (在浏览器 Console 中输出详细日志)</label>
                 </div>
-            </div>
-
-            <!-- 诊断测试区域 -->
-            <div style="margin-bottom:20px;padding:12px;background:rgba(102,126,234,0.1);border-radius:8px;border:1px solid rgba(102,126,234,0.3);">
-                <div style="color:#fff;font-size:14px;font-weight:500;margin-bottom:10px;">🧪 连接诊断测试</div>
-                <div style="color:rgba(255,255,255,0.6);font-size:12px;margin-bottom:10px;">测试与 Bangumi API 的连接是否正常</div>
-                <div style="display:flex;gap:10px;align-items:center;">
-                    <button class="ks-btn ks-btn-primary" id="ks-test-connection-btn" style="padding:8px 16px;font-size:13px;">测试 Bangumi 连接</button>
-                    <span id="ks-test-status" style="font-size:12px;color:rgba(255,255,255,0.5);">点击测试</span>
-                </div>
-                <div id="ks-test-result" style="margin-top:10px;font-size:12px;color:rgba(255,255,255,0.7);font-family:monospace;white-space:pre-wrap;"></div>
             </div>
 
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1);">
@@ -1250,160 +1060,8 @@
             modal.remove();
         };
 
-        // 添加测试连接功能
-        document.getElementById('ks-test-connection-btn').onclick = async function() {
-            const statusEl = document.getElementById('ks-test-status');
-            const resultEl = document.getElementById('ks-test-result');
-
-            statusEl.textContent = '⏳ 正在测试...';
-            statusEl.style.color = '#ffc107';
-            resultEl.textContent = '';
-
-            // 先保存当前的代理设置
-            const tempConfig = getConfig();
-            const tempEnabled = document.getElementById('ks-setting-proxy-enabled').checked;
-            const tempRaw = document.getElementById('ks-setting-proxy-url').value.trim();
-
-            if (tempEnabled) {
-                if (!tempRaw) {
-                    statusEl.textContent = '❌ 代理地址为空';
-                    statusEl.style.color = '#f44336';
-                    resultEl.textContent = '请先填写代理地址后再测试。';
-                    return;
-                }
-                const check = validateProxyUrl(tempRaw);
-                if (!check.valid) {
-                    statusEl.textContent = '❌ 代理地址格式错误';
-                    statusEl.style.color = '#f44336';
-                    resultEl.textContent = check.reason + '\n\n正确示例：\n  http://127.0.0.1:7890\n  socks5://127.0.0.1:1080';
-                    return;
-                }
-                tempConfig.proxy.enabled = true;
-                tempConfig.proxy.url = check.url;
-            } else {
-                tempConfig.proxy.enabled = false;
-                tempConfig.proxy.url = tempRaw;
-            }
-            tempConfig.debug = true;
-
-            // 临时保存
-            const originalConfig = JSON.parse(JSON.stringify(tempConfig));
-
-            try {
-                const testUrl = 'https://api.bgm.tv/search/subject/%E5%B0%91%E5%A5%B3?type=1&responseGroup=small&max_results=1';
-                const startTime = Date.now();
-
-                const response = await fetchWithBackup({
-                    method: 'GET',
-                    url: testUrl,
-                    headers: {
-                        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-                        'Accept': 'application/json',
-                        'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                    },
-                    timeout: 15000
-                });
-
-                const elapsed = Date.now() - startTime;
-
-                if (response.status === 200) {
-                    statusEl.textContent = '✅ 连接成功';
-                    statusEl.style.color = '#4caf50';
-
-                    const resultText = [
-                        '┌─ 连接测试报告 ─┐',
-                        '│ 状态: 成功',
-                        '│ HTTP 状态码: ' + response.status,
-                        '│ 响应时间: ' + elapsed + 'ms',
-                        '│ 使用代理: ' + (tempConfig.proxy.enabled ? '是 (' + tempConfig.proxy.url + ')' : '否'),
-                        '│ 数据可用: ' + (response.data ? '是' : '否'),
-                        '│ 响应长度: ' + (response.raw ? response.raw.length : 0) + ' bytes',
-                        '└─────────────────┘',
-                        '',
-                        '🎉 Bangumi API 连接正常，可以开始刮削！'
-                    ].join('\n');
-                    resultEl.textContent = resultText;
-                } else {
-                    statusEl.textContent = '⚠️ 连接异常';
-                    statusEl.style.color = '#ff9800';
-
-                    let errorDetail = '';
-                    if (response.status === 0) {
-                        errorDetail = [
-                            '问题诊断:',
-                            '  • 请求被 CORS 策略阻止',
-                            '  • 或无法连接到服务器',
-                            '',
-                            '建议解决方案:',
-                            '  1. 配置本地代理服务器',
-                            '  2. 在 Tampermonkey 设置中检查网络权限',
-                            '  3. 确认 api.bgm.tv 在 @connect 列表中',
-                            '  4. 检查防火墙设置'
-                        ].join('\n');
-                    } else {
-                        errorDetail = '服务器返回状态码: ' + response.status;
-                    }
-
-                    const resultText = [
-                        '┌─ 连接测试报告 ─┐',
-                        '│ 状态: 失败',
-                        '│ HTTP 状态码: ' + response.status,
-                        '│ 响应时间: ' + elapsed + 'ms',
-                        '│ 使用代理: ' + (tempConfig.proxy.enabled ? '是' : '否'),
-                        '└─────────────────┘',
-                        '',
-                        errorDetail
-                    ].join('\n');
-                    resultEl.textContent = resultText;
-                }
-            } catch (error) {
-                const elapsed = Date.now() - startTime;
-                statusEl.textContent = '❌ 连接失败';
-                statusEl.style.color = '#f44336';
-
-                const resultText = [
-                    '┌─ 连接测试报告 ─┐',
-                    '│ 状态: 严重错误',
-                    '│ 错误信息: ' + error.message,
-                    '│ 响应时间: ' + elapsed + 'ms',
-                    '│ 使用代理: ' + (tempConfig.proxy.enabled ? '是' : '否'),
-                    '└─────────────────┘',
-                    '',
-                    '💡 请检查:',
-                    '  1. 网络连接是否正常',
-                    '  2. 代理服务器是否运行',
-                    '  3. Bangumi API 是否可访问',
-                    '  4. Tampermonkey 权限设置'
-                ].join('\n');
-                resultEl.textContent = resultText;
-            }
-        };
-
         document.getElementById('ks-save-btn').onclick = function() {
             const newConfig = getConfig();
-            const enabled = document.getElementById('ks-setting-proxy-enabled').checked;
-            const rawUrl = document.getElementById('ks-setting-proxy-url').value.trim();
-
-            if (enabled) {
-                if (!rawUrl) {
-                    alert('代理已启用，但代理地址为空。请填写代理地址或取消启用代理。');
-                    return;
-                }
-                const check = validateProxyUrl(rawUrl);
-                if (!check.valid) {
-                    alert('代理地址格式不正确：\n' + check.reason + '\n\n正确格式示例：\n  http://127.0.0.1:7890\n  socks5://127.0.0.1:1080');
-                    return;
-                }
-                if (check.url !== rawUrl) {
-                    alert('代理地址已自动调整为：\n' + check.url + '\n\n（原输入：' + rawUrl + '）');
-                }
-                newConfig.proxy.enabled = true;
-                newConfig.proxy.url = check.url;
-            } else {
-                newConfig.proxy.enabled = false;
-                newConfig.proxy.url = rawUrl;
-            }
-
             newConfig.rateLimit.minInterval = parseInt(document.getElementById('ks-setting-rate-limit').value) || 2000;
             newConfig.debug = document.getElementById('ks-setting-debug').checked;
 
@@ -1472,7 +1130,7 @@
                 searchResults = await scrapeFromBangumi(cleanKeyword);
             } catch (e) {
                 loading.remove();
-                showError('搜索请求失败', '请检查网络连接或代理设置', function() {
+                showError('搜索请求失败', '请检查网络连接', function() {
                     startScrapeProcess(source);
                 });
                 return;
