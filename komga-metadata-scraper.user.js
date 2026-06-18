@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      0.1.1
+// @version      0.1.4
 // @description  Metadata scraper for Komga comics server - 从外部数据源获取漫画/书籍元数据
 // @author       You
 // @match        http://192.168.0.204:25600/*
@@ -428,7 +428,11 @@
         const metadata = currentMetadata || {};
         const newMetadata = {};
 
-        newMetadata.title = bangumiData.title || bangumiData.originalTitle || metadata.title;
+        const isZh = String(metadata.language || '').toLowerCase() === 'zh';
+        const preferredTitle = isZh ? bangumiData.title : bangumiData.originalTitle;
+        const fallbackTitle = isZh ? bangumiData.originalTitle : bangumiData.title;
+        newMetadata.title = preferredTitle || fallbackTitle || metadata.title;
+
         newMetadata.summary = bangumiData.summary || metadata.summary;
         newMetadata.status = mapBangumiStatus(bangumiData.status) || metadata.status;
 
@@ -443,7 +447,11 @@
         const metadata = currentMetadata || {};
         const newMetadata = {};
 
-        newMetadata.title = bangumiData.title || bangumiData.originalTitle || metadata.title;
+        const isZh = String(metadata.language || '').toLowerCase() === 'zh';
+        const preferredTitle = isZh ? bangumiData.title : bangumiData.originalTitle;
+        const fallbackTitle = isZh ? bangumiData.originalTitle : bangumiData.title;
+        newMetadata.title = preferredTitle || fallbackTitle || metadata.title;
+
         newMetadata.summary = bangumiData.summary || metadata.summary;
         newMetadata.releaseDate = bangumiData.airDate || metadata.releaseDate;
 
@@ -892,14 +900,18 @@
             ? mapBangumiToSeries(scrapeResult, currentMetadata)
             : mapBangumiToBook(scrapeResult, currentMetadata);
 
+        function isFieldLocked(key) {
+            return currentMetadata[key + 'Lock'] === true;
+        }
+
         const fields = [
-            { key: 'title', label: '标题', type: 'text', value: mappedMetadata.title || '', checked: true },
-            { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: true },
-            { key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !!mappedMetadata.status }
+            { key: 'title', label: '标题', type: 'text', value: mappedMetadata.title || '', checked: !isFieldLocked('title'), locked: isFieldLocked('title') },
+            { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: !isFieldLocked('summary'), locked: isFieldLocked('summary') },
+            { key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') }
         ];
 
         if (pageType === 'book') {
-            fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !!mappedMetadata.releaseDate });
+            fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !isFieldLocked('releaseDate') && !!mappedMetadata.releaseDate, locked: isFieldLocked('releaseDate') });
         }
 
         let previewHtml = '<div style="padding:4px 0;">';
@@ -936,16 +948,24 @@
         fields.forEach(function(field) {
             const isTextarea = field.type === 'textarea';
             const safeValue = String(field.value || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+            const rowBg = field.locked ? 'rgba(255,255,255,0.015)' : 'rgba(255,255,255,0.03)';
+            const rowBorder = field.locked ? 'rgba(255,200,100,0.25)' : 'rgba(255,255,255,0.06)';
+            const labelColor = field.locked ? 'rgba(255,255,255,0.5)' : '#fff';
+            const inputDisabled = field.locked ? 'disabled' : '';
+            const checkboxDisabled = field.locked ? 'disabled' : '';
+            const cursorStyle = field.locked ? 'not-allowed' : 'pointer';
+            const inputOpacity = field.locked ? 'opacity:0.55;' : '';
+            const lockBadge = field.locked ? `<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>` : '';
             previewHtml += `
-                <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
-                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;">
-                        <input type="checkbox" class="ks-field-checkbox" data-field="${field.key}" ${field.checked ? 'checked' : ''} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
-                        <span style="color:#fff;font-size:14px;font-weight:500;">${field.label}</span>
+                <div class="ks-field-row" style="background:${rowBg};border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid ${rowBorder};">
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:${cursorStyle};">
+                        <input type="checkbox" class="ks-field-checkbox" data-field="${field.key}" data-locked="${field.locked ? 'true' : 'false'}" ${field.checked ? 'checked' : ''} ${checkboxDisabled} style="width:16px;height:16px;accent-color:#667eea;cursor:${cursorStyle};">
+                        <span style="color:${labelColor};font-size:14px;font-weight:500;">${field.label}${lockBadge}</span>
                     </label>
                     ${isTextarea ? `
-                        <textarea class="ks-field-input" data-field="${field.key}" style="width:calc(100% - 16px);min-height:80px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${safeValue}</textarea>
+                        <textarea class="ks-field-input" data-field="${field.key}" ${inputDisabled} style="width:calc(100% - 16px);min-height:80px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;${inputOpacity}">${safeValue}</textarea>
                     ` : `
-                        <input type="text" class="ks-field-input" data-field="${field.key}" value="${safeValue}" style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                        <input type="text" class="ks-field-input" data-field="${field.key}" value="${safeValue}" ${inputDisabled} style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;${inputOpacity}">
                     `}
                 </div>
             `;
@@ -980,13 +1000,20 @@
 
         document.getElementById('ks-confirm-btn').onclick = function() {
             const checkboxes = modal.querySelectorAll('.ks-field-checkbox');
-            const inputs = modal.querySelectorAll('.ks-field-input');
             const selectedFields = {};
             const updatedFields = [];
+            const skippedFields = [];
 
             checkboxes.forEach(function(cb) {
+                const fieldKey = cb.getAttribute('data-field');
+                const isLocked = cb.getAttribute('data-locked') === 'true' || currentMetadata[fieldKey + 'Lock'] === true;
+                if (isLocked) {
+                    if (cb.checked) {
+                        skippedFields.push(fieldKey);
+                    }
+                    return;
+                }
                 if (cb.checked) {
-                    const fieldKey = cb.getAttribute('data-field');
                     const input = modal.querySelector('.ks-field-input[data-field="' + fieldKey + '"]');
                     if (input) {
                         selectedFields[fieldKey] = input.value;
@@ -995,6 +1022,10 @@
                     }
                 }
             });
+
+            if (config.debug && skippedFields.length > 0) {
+                console.log('[KomgaScraper] Skipped locked fields:', skippedFields);
+            }
 
             modal.remove();
             onConfirm(selectedFields, updatedFields);
@@ -1111,7 +1142,15 @@
             if (pageType === 'series') {
                 searchTitle = currentData.metadata && currentData.metadata.title ? currentData.metadata.title : currentData.name;
             } else {
-                searchTitle = currentData.metadata && currentData.metadata.title ? currentData.metadata.title : currentData.name;
+                const seriesTitle = currentData.seriesTitle ? currentData.seriesTitle.trim() : '';
+                const bookNumber = currentData.number != null ? String(currentData.number) : '';
+                if (seriesTitle && bookNumber) {
+                    searchTitle = seriesTitle + ' ' + bookNumber;
+                } else if (seriesTitle) {
+                    searchTitle = seriesTitle;
+                } else {
+                    searchTitle = currentData.name;
+                }
             }
 
             const cleanKeyword = cleanSearchKeyword(searchTitle);
@@ -1145,7 +1184,7 @@
                         return;
                     }
 
-                    writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields);
+                    writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData);
                 });
             });
 
@@ -1155,23 +1194,43 @@
         }
     }
 
-    async function writeMetadataToKomga(pageType, pageId, metadata, updatedFields) {
+    async function writeMetadataToKomga(pageType, pageId, metadata, updatedFields, currentData) {
         try {
             const config = getConfig();
-            if (config.debug) console.log('[KomgaScraper] Writing metadata to Komga:', metadata);
+
+            const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
+            const finalMetadata = {};
+            const finalUpdated = [];
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期' };
+
+            Object.keys(metadata).forEach(function(key) {
+                if (currentMetadata[key + 'Lock'] === true) {
+                    if (config.debug) console.log('[KomgaScraper] Skipping locked field:', key);
+                    return;
+                }
+                finalMetadata[key] = metadata[key];
+                finalUpdated.push(fieldLabels[key] || key);
+            });
+
+            if (Object.keys(finalMetadata).length === 0) {
+                showError('无可用字段', '所有勾选的字段都已被锁定，无法写入');
+                return;
+            }
+
+            if (config.debug) console.log('[KomgaScraper] Writing metadata to Komga:', finalMetadata);
 
             showLoading('正在写入元数据到 Komga...');
 
             let success;
             if (pageType === 'series') {
-                success = await updateSeriesMetadata(pageId, metadata);
+                success = await updateSeriesMetadata(pageId, finalMetadata);
             } else {
-                success = await updateBookMetadata(pageId, metadata);
+                success = await updateBookMetadata(pageId, finalMetadata);
             }
 
             if (success) {
                 if (config.debug) console.log('[KomgaScraper] Metadata updated successfully');
-                showSuccess(updatedFields, function() {
+                showSuccess(finalUpdated, function() {
                     window.location.reload();
                 });
             } else {
