@@ -1,12 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.0.0
-// @description  Metadata scraper for Komga comics server - 从外部数据源获取漫画/书籍元数据
-// @author       You// ==UserScript==
-// @name         Komga Metadata Scraper
-// @namespace    https://github.com/yourname/komga-scraper
-// @version      0.1.5
+// @version      1.0.2
 // @description  Metadata scraper for Komga comics server - 从外部数据源获取漫画/书籍元数据
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -426,6 +421,83 @@
         return s.trim();
     }
 
+    function convertIsbn10ToIsbn13(isbn10) {
+        if (!isbn10 || isbn10.length !== 10) return '';
+        const prefix = '978' + isbn10.substring(0, 9);
+        let sum = 0;
+        for (let i = 0; i < prefix.length; i++) {
+            const digit = parseInt(prefix.charAt(i), 10);
+            if (isNaN(digit)) return '';
+            sum += (i % 2 === 0) ? digit : digit * 3;
+        }
+        const check = (10 - (sum % 10)) % 10;
+        return prefix + check;
+    }
+
+    function normalizeIsbn(rawIsbn) {
+        if (!rawIsbn) return '';
+        const digits = String(rawIsbn).replace(/[^0-9Xx]/g, '').toUpperCase();
+        if (digits.length === 13) {
+            return digits;
+        }
+        if (digits.length === 10) {
+            return convertIsbn10ToIsbn13(digits);
+        }
+        return '';
+    }
+
+    function mergeTags(newTags, currentTags) {
+        const seen = {};
+        const result = [];
+        const addTag = function(t) {
+            const s = String(t || '').trim();
+            if (!s) return;
+            if (seen[s]) return;
+            seen[s] = true;
+            result.push(s);
+        };
+        if (Array.isArray(currentTags)) {
+            currentTags.forEach(addTag);
+        } else if (currentTags && typeof currentTags === 'string') {
+            currentTags.split(/[,，]/).forEach(addTag);
+        }
+        if (Array.isArray(newTags)) {
+            newTags.forEach(addTag);
+        } else if (newTags && typeof newTags === 'string') {
+            newTags.split(/[,，]/).forEach(addTag);
+        }
+        return result;
+    }
+
+    function mergeLinks(newLinks, currentLinks) {
+        const byUrl = {};
+        const result = [];
+        const addLink = function(link) {
+            if (!link) return;
+            const url = cleanUrl(link.url);
+            if (!url) return;
+            const label = String(link.label || '').trim();
+            if (!byUrl[url]) {
+                const entry = { label: label, url: url };
+                byUrl[url] = entry;
+                result.push(entry);
+            } else if (label && !byUrl[url].label) {
+                byUrl[url].label = label;
+            }
+        };
+        if (Array.isArray(currentLinks)) {
+            currentLinks.forEach(addLink);
+        }
+        if (Array.isArray(newLinks)) {
+            newLinks.forEach(addLink);
+        }
+        return result;
+    }
+
+    function isArrayField(key) {
+        return key === 'tags' || key === 'links' || key === 'authors';
+    }
+
     function extractFromInfobox(infobox, keyPatterns, excludePatterns, validator) {
         if (!infobox || !Array.isArray(infobox)) return '';
         const excl = excludePatterns || [];
@@ -568,7 +640,8 @@
 
         newMetadata.releaseDate = bangumiData.airDate || metadata.releaseDate;
 
-        if (bangumiData.isbn) newMetadata.isbn = bangumiData.isbn;
+        const normalizedIsbn = normalizeIsbn(bangumiData.isbn);
+        if (normalizedIsbn) newMetadata.isbn = normalizedIsbn;
         if (bangumiData.pages) newMetadata.pages = bangumiData.pages;
         if (bangumiData.authors && bangumiData.authors.length > 0) {
             newMetadata.authors = bangumiData.authors;
@@ -712,9 +785,7 @@
             const isbnRaw = extractFromInfobox(infobox, ['ISBN', 'isbn', 'Isbn']);
             let isbn = '';
             if (isbnRaw) {
-                const isbnMatch = isbnRaw.replace(/[^0-9]/g, '');
-                if (isbnMatch.length === 13) isbn = isbnMatch;
-                else if (isbnMatch.length > 0) isbn = isbnMatch;
+                isbn = normalizeIsbn(isbnRaw);
             }
 
             const dateExcludePatterns = ['商', '社', '者', '国家', '地区', '语言', '定价', '价格'];
@@ -1719,6 +1790,37 @@
             `;
         }
 
+        if (pageType === 'series') {
+            const rdLocked = currentMetadata.readingDirectionLock === true;
+            const currentRd = (currentMetadata.readingDirection || '').toUpperCase();
+            const defaultRd = 'RIGHT_TO_LEFT';
+            const options = [
+                { label: '从右到左（日漫 / 港台）', value: 'RIGHT_TO_LEFT' },
+                { label: '从左到右（欧漫 / 美漫 / 国漫）', value: 'LEFT_TO_RIGHT' },
+                { label: '纵向（Webtoon）', value: 'VERTICAL' },
+                { label: '不修改', value: '' }
+            ];
+            let selectHtml = '';
+            options.forEach(function(opt) {
+                const selected = (currentRd && currentRd === opt.value)
+                    ? 'selected'
+                    : (!currentRd && opt.value === defaultRd ? 'selected' : '');
+                selectHtml += '<option value="' + opt.value + '" ' + selected + '>' + opt.label + '</option>';
+            });
+            previewHtml += `
+                <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
+                        <input type="checkbox" class="ks-reading-direction-checkbox" ${rdLocked ? 'disabled' : ''} checked style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                        <span style="color:#fff;font-size:14px;font-weight:500;">阅读方向 (Reading Direction)${rdLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
+                    </label>
+                    <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">默认设置为从右到左，可根据实际漫画类型手动切换</div>
+                    <select class="ks-reading-direction" ${rdLocked ? 'disabled' : ''} style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                        ${selectHtml}
+                    </select>
+                </div>
+            `;
+        }
+
         previewHtml += `
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1);">
                 <button class="ks-btn ks-btn-secondary" id="ks-cancel-btn">取消</button>
@@ -1751,7 +1853,7 @@
             const selectedFields = {};
             const updatedFields = [];
             const skippedFields = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签' };
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -1807,6 +1909,18 @@
                                 updatedFields.push('标签');
                             }
                         }
+                    }
+                }
+            }
+
+            if (pageType === 'series') {
+                const rdCb = modal.querySelector('.ks-reading-direction-checkbox');
+                const rdSelect = modal.querySelector('.ks-reading-direction');
+                if (rdCb && rdCb.checked && rdSelect) {
+                    const rdValue = String(rdSelect.value || '').trim();
+                    if (rdValue) {
+                        selectedFields.readingDirection = rdValue;
+                        updatedFields.push('阅读方向');
                     }
                 }
             }
@@ -2056,7 +2170,8 @@
             const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
             const finalMetadata = {};
             const finalUpdated = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签' };
+            const writtenScalarKeys = [];
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向' };
 
             if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
@@ -2070,17 +2185,12 @@
                 }
 
                 if (key === 'links') {
-                    if (Array.isArray(value) && value.length > 0) {
-                        const cleanedLinks = value.map(function(link) {
-                            return {
-                                label: String(link.label || '').trim(),
-                                url: cleanUrl(link.url)
-                            };
-                        }).filter(function(link) { return link.url; });
-                        if (cleanedLinks.length > 0) {
-                            finalMetadata.links = cleanedLinks;
-                            finalUpdated.push(fieldLabels.links || 'links');
-                        }
+                    const existingLinks = Array.isArray(currentMetadata.links) ? currentMetadata.links : [];
+                    const incoming = Array.isArray(value) ? value : [];
+                    const merged = mergeLinks(incoming, existingLinks);
+                    if (merged.length > 0) {
+                        finalMetadata.links = merged;
+                        finalUpdated.push(fieldLabels.links || 'links');
                     }
                     return;
                 }
@@ -2116,16 +2226,12 @@
                 }
 
                 if (key === 'tags') {
-                    if (Array.isArray(value) && value.length > 0) {
-                        const validTags = value.map(function(t) {
-                            return String(t).trim();
-                        }).filter(function(t) {
-                            return t && t.length > 0 && t.length <= 100;
-                        });
-                        if (validTags.length > 0) {
-                            finalMetadata.tags = validTags;
-                            finalUpdated.push('标签');
-                        }
+                    const existingTags = Array.isArray(currentMetadata.tags) ? currentMetadata.tags : [];
+                    const incoming = Array.isArray(value) ? value : (typeof value === 'string' ? [value] : []);
+                    const merged = mergeTags(incoming, existingTags);
+                    if (merged.length > 0) {
+                        finalMetadata.tags = merged;
+                        finalUpdated.push('标签');
                     }
                     return;
                 }
@@ -2134,6 +2240,7 @@
                     if (value && typeof value === 'string' && looksLikeDate(value)) {
                         finalMetadata.releaseDate = String(value).trim();
                         finalUpdated.push(fieldLabels.releaseDate || 'releaseDate');
+                        writtenScalarKeys.push('releaseDate');
                     } else if (config.debug) {
                         console.log('[KomgaScraper] Skipping invalid releaseDate value:', value);
                     }
@@ -2142,12 +2249,27 @@
 
                 if (key === 'isbn') {
                     if (value && typeof value === 'string') {
-                        const cleanIsbn = value.replace(/[^0-9]/g, '');
-                        if (cleanIsbn.length >= 10) {
-                            finalMetadata.isbn = cleanIsbn;
+                        const normalizedIsbn = normalizeIsbn(value);
+                        if (normalizedIsbn) {
+                            finalMetadata.isbn = normalizedIsbn;
                             finalUpdated.push(fieldLabels.isbn || 'isbn');
+                            writtenScalarKeys.push('isbn');
                         } else if (config.debug) {
                             console.log('[KomgaScraper] Skipping invalid ISBN value:', value);
+                        }
+                    }
+                    return;
+                }
+
+                if (key === 'readingDirection') {
+                    if (value && typeof value === 'string') {
+                        const rd = String(value).trim().toUpperCase();
+                        if (['RIGHT_TO_LEFT', 'LEFT_TO_RIGHT', 'VERTICAL', 'WEBTOON'].indexOf(rd) !== -1) {
+                            finalMetadata.readingDirection = rd;
+                            finalUpdated.push(fieldLabels.readingDirection || 'readingDirection');
+                            writtenScalarKeys.push('readingDirection');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid readingDirection value:', value);
                         }
                     }
                     return;
@@ -2159,6 +2281,16 @@
                     finalMetadata[key] = value;
                 }
                 finalUpdated.push(fieldLabels[key] || key);
+                if (!isArrayField(key)) {
+                    writtenScalarKeys.push(key);
+                }
+            });
+
+            // 自动为写入的标量字段加锁，防止后续被 Komga 自带扫描覆盖
+            writtenScalarKeys.forEach(function(key) {
+                if (currentMetadata[key + 'Lock'] !== true) {
+                    finalMetadata[key + 'Lock'] = true;
+                }
             });
 
             if (Object.keys(finalMetadata).length === 0) {
@@ -2705,6 +2837,83 @@
         return s.trim();
     }
 
+    function convertIsbn10ToIsbn13(isbn10) {
+        if (!isbn10 || isbn10.length !== 10) return '';
+        const prefix = '978' + isbn10.substring(0, 9);
+        let sum = 0;
+        for (let i = 0; i < prefix.length; i++) {
+            const digit = parseInt(prefix.charAt(i), 10);
+            if (isNaN(digit)) return '';
+            sum += (i % 2 === 0) ? digit : digit * 3;
+        }
+        const check = (10 - (sum % 10)) % 10;
+        return prefix + check;
+    }
+
+    function normalizeIsbn(rawIsbn) {
+        if (!rawIsbn) return '';
+        const digits = String(rawIsbn).replace(/[^0-9Xx]/g, '').toUpperCase();
+        if (digits.length === 13) {
+            return digits;
+        }
+        if (digits.length === 10) {
+            return convertIsbn10ToIsbn13(digits);
+        }
+        return '';
+    }
+
+    function mergeTags(newTags, currentTags) {
+        const seen = {};
+        const result = [];
+        const addTag = function(t) {
+            const s = String(t || '').trim();
+            if (!s) return;
+            if (seen[s]) return;
+            seen[s] = true;
+            result.push(s);
+        };
+        if (Array.isArray(currentTags)) {
+            currentTags.forEach(addTag);
+        } else if (currentTags && typeof currentTags === 'string') {
+            currentTags.split(/[,，]/).forEach(addTag);
+        }
+        if (Array.isArray(newTags)) {
+            newTags.forEach(addTag);
+        } else if (newTags && typeof newTags === 'string') {
+            newTags.split(/[,，]/).forEach(addTag);
+        }
+        return result;
+    }
+
+    function mergeLinks(newLinks, currentLinks) {
+        const byUrl = {};
+        const result = [];
+        const addLink = function(link) {
+            if (!link) return;
+            const url = cleanUrl(link.url);
+            if (!url) return;
+            const label = String(link.label || '').trim();
+            if (!byUrl[url]) {
+                const entry = { label: label, url: url };
+                byUrl[url] = entry;
+                result.push(entry);
+            } else if (label && !byUrl[url].label) {
+                byUrl[url].label = label;
+            }
+        };
+        if (Array.isArray(currentLinks)) {
+            currentLinks.forEach(addLink);
+        }
+        if (Array.isArray(newLinks)) {
+            newLinks.forEach(addLink);
+        }
+        return result;
+    }
+
+    function isArrayField(key) {
+        return key === 'tags' || key === 'links' || key === 'authors';
+    }
+
     function extractFromInfobox(infobox, keyPatterns, excludePatterns, validator) {
         if (!infobox || !Array.isArray(infobox)) return '';
         const excl = excludePatterns || [];
@@ -2847,7 +3056,8 @@
 
         newMetadata.releaseDate = bangumiData.airDate || metadata.releaseDate;
 
-        if (bangumiData.isbn) newMetadata.isbn = bangumiData.isbn;
+        const normalizedIsbn = normalizeIsbn(bangumiData.isbn);
+        if (normalizedIsbn) newMetadata.isbn = normalizedIsbn;
         if (bangumiData.pages) newMetadata.pages = bangumiData.pages;
         if (bangumiData.authors && bangumiData.authors.length > 0) {
             newMetadata.authors = bangumiData.authors;
@@ -2991,9 +3201,7 @@
             const isbnRaw = extractFromInfobox(infobox, ['ISBN', 'isbn', 'Isbn']);
             let isbn = '';
             if (isbnRaw) {
-                const isbnMatch = isbnRaw.replace(/[^0-9]/g, '');
-                if (isbnMatch.length === 13) isbn = isbnMatch;
-                else if (isbnMatch.length > 0) isbn = isbnMatch;
+                isbn = normalizeIsbn(isbnRaw);
             }
 
             const dateExcludePatterns = ['商', '社', '者', '国家', '地区', '语言', '定价', '价格'];
@@ -3514,6 +3722,37 @@
             previewHtml += `</div>`;
         }
 
+        if (pageType === 'series') {
+            const rdLocked = currentMetadata.readingDirectionLock === true;
+            const currentRd = (currentMetadata.readingDirection || '').toUpperCase();
+            const defaultRd = 'RIGHT_TO_LEFT';
+            const options = [
+                { label: '从右到左（日漫 / 港台）', value: 'RIGHT_TO_LEFT' },
+                { label: '从左到右（欧漫 / 美漫 / 国漫）', value: 'LEFT_TO_RIGHT' },
+                { label: '纵向（Webtoon）', value: 'VERTICAL' },
+                { label: '不修改', value: '' }
+            ];
+            let selectHtml = '';
+            options.forEach(function(opt) {
+                const selected = (currentRd && currentRd === opt.value)
+                    ? 'selected'
+                    : (!currentRd && opt.value === defaultRd ? 'selected' : '');
+                selectHtml += '<option value="' + opt.value + '" ' + selected + '>' + opt.label + '</option>';
+            });
+            previewHtml += `
+                <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
+                        <input type="checkbox" class="ks-reading-direction-checkbox" ${rdLocked ? 'disabled' : ''} checked style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                        <span style="color:#fff;font-size:14px;font-weight:500;">阅读方向 (Reading Direction)${rdLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
+                    </label>
+                    <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">默认设置为从右到左，可根据实际漫画类型手动切换</div>
+                    <select class="ks-reading-direction" ${rdLocked ? 'disabled' : ''} style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                        ${selectHtml}
+                    </select>
+                </div>
+            `;
+        }
+
         previewHtml += `
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1);">
                 <button class="ks-btn ks-btn-secondary" id="ks-cancel-btn">取消</button>
@@ -3546,7 +3785,7 @@
             const selectedFields = {};
             const updatedFields = [];
             const skippedFields = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者' };
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', readingDirection: '阅读方向' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -3587,6 +3826,18 @@
             if (hasLinks) {
                 selectedFields.links = scrapeResult.links;
                 updatedFields.push('来源链接');
+            }
+
+            if (pageType === 'series') {
+                const rdCb = modal.querySelector('.ks-reading-direction-checkbox');
+                const rdSelect = modal.querySelector('.ks-reading-direction');
+                if (rdCb && rdCb.checked && rdSelect) {
+                    const rdValue = String(rdSelect.value || '').trim();
+                    if (rdValue) {
+                        selectedFields.readingDirection = rdValue;
+                        updatedFields.push('阅读方向');
+                    }
+                }
             }
 
             if (config.debug && skippedFields.length > 0) {
@@ -3793,7 +4044,8 @@
             const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
             const finalMetadata = {};
             const finalUpdated = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接' };
+            const writtenScalarKeys = [];
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', readingDirection: '阅读方向' };
 
             if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
@@ -3807,17 +4059,12 @@
                 }
 
                 if (key === 'links') {
-                    if (Array.isArray(value) && value.length > 0) {
-                        const cleanedLinks = value.map(function(link) {
-                            return {
-                                label: String(link.label || '').trim(),
-                                url: cleanUrl(link.url)
-                            };
-                        }).filter(function(link) { return link.url; });
-                        if (cleanedLinks.length > 0) {
-                            finalMetadata.links = cleanedLinks;
-                            finalUpdated.push(fieldLabels.links || 'links');
-                        }
+                    const existingLinks = Array.isArray(currentMetadata.links) ? currentMetadata.links : [];
+                    const incoming = Array.isArray(value) ? value : [];
+                    const merged = mergeLinks(incoming, existingLinks);
+                    if (merged.length > 0) {
+                        finalMetadata.links = merged;
+                        finalUpdated.push(fieldLabels.links || 'links');
                     }
                     return;
                 }
@@ -3856,6 +4103,7 @@
                     if (value && typeof value === 'string' && looksLikeDate(value)) {
                         finalMetadata.releaseDate = String(value).trim();
                         finalUpdated.push(fieldLabels.releaseDate || 'releaseDate');
+                        writtenScalarKeys.push('releaseDate');
                     } else if (config.debug) {
                         console.log('[KomgaScraper] Skipping invalid releaseDate value:', value);
                     }
@@ -3864,12 +4112,27 @@
 
                 if (key === 'isbn') {
                     if (value && typeof value === 'string') {
-                        const cleanIsbn = value.replace(/[^0-9]/g, '');
-                        if (cleanIsbn.length >= 10) {
-                            finalMetadata.isbn = cleanIsbn;
+                        const normalizedIsbn = normalizeIsbn(value);
+                        if (normalizedIsbn) {
+                            finalMetadata.isbn = normalizedIsbn;
                             finalUpdated.push(fieldLabels.isbn || 'isbn');
+                            writtenScalarKeys.push('isbn');
                         } else if (config.debug) {
                             console.log('[KomgaScraper] Skipping invalid ISBN value:', value);
+                        }
+                    }
+                    return;
+                }
+
+                if (key === 'readingDirection') {
+                    if (value && typeof value === 'string') {
+                        const rd = String(value).trim().toUpperCase();
+                        if (['RIGHT_TO_LEFT', 'LEFT_TO_RIGHT', 'VERTICAL', 'WEBTOON'].indexOf(rd) !== -1) {
+                            finalMetadata.readingDirection = rd;
+                            finalUpdated.push(fieldLabels.readingDirection || 'readingDirection');
+                            writtenScalarKeys.push('readingDirection');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid readingDirection value:', value);
                         }
                     }
                     return;
@@ -3881,6 +4144,16 @@
                     finalMetadata[key] = value;
                 }
                 finalUpdated.push(fieldLabels[key] || key);
+                if (!isArrayField(key)) {
+                    writtenScalarKeys.push(key);
+                }
+            });
+
+            // 自动为写入的标量字段加锁，防止后续被 Komga 自带扫描覆盖
+            writtenScalarKeys.forEach(function(key) {
+                if (currentMetadata[key + 'Lock'] !== true) {
+                    finalMetadata[key + 'Lock'] = true;
+                }
             });
 
             if (Object.keys(finalMetadata).length === 0) {
