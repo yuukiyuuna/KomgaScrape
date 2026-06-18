@@ -1,12 +1,10 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      0.1.4
+// @version      0.1.5
 // @description  Metadata scraper for Komga comics server - 从外部数据源获取漫画/书籍元数据
 // @author       You
-// @match        http://192.168.0.204:25600/*
-// @match        http://localhost:25600/*
-// @match        https://*/*
+// @match        {你自己的komga网站地址}
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -54,6 +52,7 @@
         write: {
             autoLockFields: []
         },
+        autoRefresh: true,
         debug: false
     };
 
@@ -380,6 +379,7 @@
             if (response.status === 200 || response.status === 204) {
                 return true;
             }
+            console.error('[KomgaScraper] updateSeriesMetadata failed - status:', response.status, 'response:', response.raw || response.text || response.data);
             return false;
         } catch (e) {
             console.error('[KomgaScraper] Failed to update series metadata:', e);
@@ -402,6 +402,7 @@
             if (response.status === 200 || response.status === 204) {
                 return true;
             }
+            console.error('[KomgaScraper] updateBookMetadata failed - status:', response.status, 'response:', response.raw || response.text || response.data);
             return false;
         } catch (e) {
             console.error('[KomgaScraper] Failed to update book metadata:', e);
@@ -424,6 +425,129 @@
         return statusMap[bangumiStatus] || '';
     }
 
+    function getInfoboxValue(val) {
+        if (typeof val === 'string') return val;
+        if (Array.isArray(val) && val.length > 0) {
+            const first = val[0];
+            if (first && typeof first === 'object' && 'v' in first) return String(first.v);
+            return String(first);
+        }
+        if (val && typeof val === 'object' && 'v' in val) return String(val.v);
+        return '';
+    }
+
+    function looksLikeDate(val) {
+        if (!val) return false;
+        const s = String(val).trim();
+        if (/^\d{4}[-\/.]\d{1,2}[-\/.]\d{1,2}/.test(s)) return true;
+        if (/^\d{4}[-\/.]\d{1,2}/.test(s)) return true;
+        if (/\d{4}年\d{1,2}月\d{0,2}/.test(s)) return true;
+        if (/^\d{4}$/.test(s)) return true;
+        return false;
+    }
+
+    function cleanUrl(url) {
+        if (!url) return '';
+        let s = String(url).trim();
+        s = s.replace(/^[\s`'"]+|[\s`'"]+$/g, '');
+        s = s.replace(/^<|>$/g, '');
+        return s.trim();
+    }
+
+    function extractFromInfobox(infobox, keyPatterns, excludePatterns, validator) {
+        if (!infobox || !Array.isArray(infobox)) return '';
+        const excl = excludePatterns || [];
+        for (let i = 0; i < infobox.length; i++) {
+            const item = infobox[i];
+            const key = String(item.key || '');
+            let matched = false;
+            for (let j = 0; j < keyPatterns.length; j++) {
+                if (key.indexOf(keyPatterns[j]) !== -1) {
+                    matched = true;
+                    break;
+                }
+            }
+            if (!matched) continue;
+            let excluded = false;
+            for (let k = 0; k < excl.length; k++) {
+                if (key.indexOf(excl[k]) !== -1) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (excluded) continue;
+            const val = getInfoboxValue(item.value);
+            if (validator && !validator(val)) continue;
+            if (val && val.trim()) return val;
+        }
+        return '';
+    }
+
+    function extractStatusFromInfobox(infobox) {
+        if (!infobox || !Array.isArray(infobox)) return null;
+        for (let i = 0; i < infobox.length; i++) {
+            const item = infobox[i];
+            const key = String(item.key || '');
+            const val = getInfoboxValue(item.value);
+            if (key.indexOf('连载') !== -1 || key.indexOf('状态') !== -1 ||
+                key.indexOf('完结') !== -1 || key.indexOf('结束') !== -1) {
+                if (val.indexOf('完结') !== -1 || val.indexOf('结束') !== -1 || val.indexOf('已完结') !== -1) {
+                    return 'ENDED';
+                }
+                if (val.indexOf('连载') !== -1 || val.indexOf('进行') !== -1 || val.indexOf('播出') !== -1) {
+                    return 'ONGOING';
+                }
+            }
+        }
+        return null;
+    }
+
+    function extractAllAuthorsFromInfobox(infobox) {
+        if (!infobox || !Array.isArray(infobox)) return [];
+
+        const keyRoles = {
+            '作者': 'writer',
+            '原作': 'writer',
+            '作画': 'artist'
+        };
+
+        const result = [];
+        const seen = {};
+
+        for (let i = 0; i < infobox.length; i++) {
+            const item = infobox[i];
+            const key = String(item.key || '');
+            const role = keyRoles[key];
+            if (!role) continue;
+
+            const rawVal = item.value;
+            const names = [];
+            if (typeof rawVal === 'string') {
+                names.push(rawVal);
+            } else if (Array.isArray(rawVal)) {
+                for (let vi = 0; vi < rawVal.length; vi++) {
+                    if (typeof rawVal[vi] === 'string') {
+                        names.push(rawVal[vi]);
+                    } else if (rawVal[vi] && typeof rawVal[vi] === 'object' && 'v' in rawVal[vi]) {
+                        names.push(String(rawVal[vi].v));
+                    }
+                }
+            } else if (rawVal && typeof rawVal === 'object' && 'v' in rawVal) {
+                names.push(String(rawVal.v));
+            }
+
+            for (let ni = 0; ni < names.length; ni++) {
+                const name = names[ni].replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
+                if (name && !seen[name]) {
+                    seen[name] = true;
+                    result.push({ name: name, role: role });
+                }
+            }
+        }
+
+        return result;
+    }
+
     function mapBangumiToSeries(bangumiData, currentMetadata) {
         const metadata = currentMetadata || {};
         const newMetadata = {};
@@ -434,10 +558,21 @@
         newMetadata.title = preferredTitle || fallbackTitle || metadata.title;
 
         newMetadata.summary = bangumiData.summary || metadata.summary;
-        newMetadata.status = mapBangumiStatus(bangumiData.status) || metadata.status;
+
+        const infoboxStatus = extractStatusFromInfobox(bangumiData.infobox);
+        newMetadata.status = infoboxStatus || mapBangumiStatus(bangumiData.status) || metadata.status;
 
         if (bangumiData.rating) {
             newMetadata.summary = (newMetadata.summary || '') + '\n\n评分: ' + bangumiData.rating;
+        }
+
+        if (bangumiData.authors && bangumiData.authors.length > 0) {
+            newMetadata.authors = bangumiData.authors;
+        } else if (bangumiData.author) {
+            newMetadata.authors = [{ name: bangumiData.author, role: 'writer' }];
+        }
+        if (bangumiData.links && bangumiData.links.length > 0) {
+            newMetadata.links = bangumiData.links;
         }
 
         return newMetadata;
@@ -452,8 +587,25 @@
         const fallbackTitle = isZh ? bangumiData.originalTitle : bangumiData.title;
         newMetadata.title = preferredTitle || fallbackTitle || metadata.title;
 
-        newMetadata.summary = bangumiData.summary || metadata.summary;
+        let summaryExtra = '';
+        if (bangumiData.pages) {
+            summaryExtra += '\n\n页数: ' + bangumiData.pages;
+        }
+        newMetadata.summary = (bangumiData.summary || metadata.summary || '') + summaryExtra;
+        if (!newMetadata.summary) delete newMetadata.summary;
+
         newMetadata.releaseDate = bangumiData.airDate || metadata.releaseDate;
+
+        if (bangumiData.isbn) newMetadata.isbn = bangumiData.isbn;
+        if (bangumiData.pages) newMetadata.pages = bangumiData.pages;
+        if (bangumiData.authors && bangumiData.authors.length > 0) {
+            newMetadata.authors = bangumiData.authors;
+        } else if (bangumiData.author) {
+            newMetadata.authors = [{ name: bangumiData.author, role: 'writer' }];
+        }
+        if (bangumiData.links && bangumiData.links.length > 0) {
+            newMetadata.links = bangumiData.links;
+        }
 
         return newMetadata;
     }
@@ -463,38 +615,46 @@
     // ============================================================
 
     const BANGUMI_API_BASE = 'https://api.bgm.tv';
-    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/1.1.0 (https://github.com/yourname/komga-scraper)';
+    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/1.2.0 (https://github.com/yourname/komga-scraper)';
 
     async function scrapeFromBangumi(keyword) {
         try {
             const config = getConfig();
             const debug = config.debug;
 
-            if (debug) console.log('[KomgaScraper] [Bangumi] Searching for keyword:', keyword);
+            if (debug) console.log('[KomgaScraper] [Bangumi] Searching v0 for keyword:', keyword);
 
-            // 构造搜索 URL
-            const encodedKeyword = encodeURIComponent(keyword);
-            const searchUrl = BANGUMI_API_BASE + '/search/subject/' + encodedKeyword + '?type=1&responseGroup=medium&max_results=10';
+            const searchUrl = BANGUMI_API_BASE + '/v0/search/subjects?limit=10';
 
             if (debug) console.log('[KomgaScraper] [Bangumi] Request URL:', searchUrl);
 
-            // 发起请求
+            const requestBody = JSON.stringify({
+                keyword: keyword,
+                sort: 'rank',
+                filter: {
+                    type: [1],
+                    nsfw: true
+                }
+            });
+
+            if (debug) console.log('[KomgaScraper] [Bangumi] Request body:', requestBody);
+
             const response = await fetchWithRateLimit({
-                method: 'GET',
+                method: 'POST',
                 url: searchUrl,
                 headers: {
                     'User-Agent': BANGUMI_USER_AGENT,
                     'Accept': 'application/json',
+                    'Content-Type': 'application/json',
                     'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                }
+                },
+                data: requestBody
             });
 
             if (debug) console.log('[KomgaScraper] [Bangumi] Response status:', response.status, 'hasData:', !!response.data);
 
-            // 检查响应
             if (response.status !== 200) {
                 console.warn('[KomgaScraper] [Bangumi] Non-200 status code:', response.status);
-                // 如果 status 为 0，说明请求被 CORS 阻止
                 if (response.status === 0) {
                     console.warn('[KomgaScraper] [Bangumi] Status 0 detected - request was blocked by CORS');
                     throw new Error('请求被阻止，请检查网络或浏览器权限');
@@ -507,24 +667,28 @@
                 return [];
             }
 
-            if (!response.data.list || response.data.list.length === 0) {
+            if (!response.data.data || response.data.data.length === 0) {
                 if (debug) console.log('[KomgaScraper] [Bangumi] No results in response');
                 return [];
             }
 
-            // 解析结果
-            const results = response.data.list.map(function(item, index) {
+            const results = response.data.data.map(function(item, index) {
+                const airDateVal = item.date || item.air_date || '';
+                const itemId = String(item.id || '').replace(/[^0-9a-zA-Z]/g, '');
+                const bangumiUrl = cleanUrl('https://bgm.tv/subject/' + itemId);
                 const result = {
-                    id: item.id,
+                    id: itemId,
                     title: item.name_cn || item.name,
                     originalTitle: item.name,
                     summary: item.summary || '',
                     image: item.images && item.images.common ? item.images.common : '',
                     largeImage: item.images && item.images.large ? item.images.large : '',
                     rating: item.rating && item.rating.score ? item.rating.score : null,
-                    status: item.air_date && item.air_date > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
-                    airDate: item.air_date || '',
-                    url: 'https://bgm.tv/subject/' + item.id
+                    status: airDateVal && airDateVal > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
+                    airDate: airDateVal,
+                    url: bangumiUrl,
+                    date: item.date || '',
+                    links: [{ label: 'Bangumi', url: bangumiUrl }]
                 };
 
                 if (debug) console.log('[KomgaScraper] [Bangumi] Result ' + (index + 1) + ':', result.title, result.originalTitle);
@@ -537,6 +701,100 @@
         } catch (e) {
             console.error('[KomgaScraper] [Bangumi] Search failed with error:', e);
             throw e;
+        }
+    }
+
+    async function fetchSubjectDetail(subjectIdParam) {
+        try {
+            const config = getConfig();
+            const debug = config.debug;
+
+            if (debug) console.log('[KomgaScraper] [Bangumi] Fetching detail for subject:', subjectIdParam);
+
+            const detailUrl = BANGUMI_API_BASE + '/v0/subjects/' + subjectIdParam;
+
+            if (debug) console.log('[KomgaScraper] [Bangumi] Detail URL:', detailUrl);
+
+            const response = await fetchWithRateLimit({
+                method: 'GET',
+                url: detailUrl,
+                headers: {
+                    'User-Agent': BANGUMI_USER_AGENT,
+                    'Accept': 'application/json',
+                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+                }
+            });
+
+            if (debug) console.log('[KomgaScraper] [Bangumi] Detail response status:', response.status);
+
+            if (response.status !== 200 || !response.data) {
+                console.warn('[KomgaScraper] [Bangumi] Failed to get subject detail');
+                return null;
+            }
+
+            const data = response.data;
+            const infobox = data.infobox || [];
+
+            if (debug) console.log('[KomgaScraper] [Bangumi] Infobox:', JSON.stringify(infobox));
+
+            const isbnRaw = extractFromInfobox(infobox, ['ISBN', 'isbn', 'Isbn']);
+            let isbn = '';
+            if (isbnRaw) {
+                const isbnMatch = isbnRaw.replace(/[^0-9]/g, '');
+                if (isbnMatch.length === 13) isbn = isbnMatch;
+                else if (isbnMatch.length > 0) isbn = isbnMatch;
+            }
+
+            const dateExcludePatterns = ['商', '社', '者', '国家', '地区', '语言', '定价', '价格'];
+            let publishDate = extractFromInfobox(
+                infobox,
+                ['发售日期', '发售日', '发售', '发行日期', '发行日', '出版日期', '出版年', '出版'],
+                dateExcludePatterns,
+                looksLikeDate
+            );
+            if (!publishDate && data.date && looksLikeDate(data.date)) publishDate = data.date;
+            if (!publishDate && data.air_date && looksLikeDate(data.air_date)) publishDate = data.air_date;
+
+            const pagesRaw = extractFromInfobox(
+                infobox,
+                ['页数', '页数', 'page', 'Page', 'p.', 'P.'],
+                ['出版社', '作者', '原作', '脚本']
+            );
+            let pages = '';
+            if (pagesRaw) {
+                const pageMatch = pagesRaw.match(/\d+/);
+                if (pageMatch) pages = pageMatch[0];
+            }
+
+            const authors = extractAllAuthorsFromInfobox(infobox);
+
+            const subjectItemId = String(data.id || '').replace(/[^0-9a-zA-Z]/g, '');
+            const subjectDate = data.date || data.air_date || '';
+            const bangumiLinkUrl = cleanUrl('https://bgm.tv/subject/' + subjectItemId);
+            const detail = {
+                id: subjectItemId,
+                title: data.name_cn || data.name,
+                originalTitle: data.name,
+                summary: data.summary || '',
+                image: data.images && data.images.common ? data.images.common : '',
+                largeImage: data.images && data.images.large ? data.images.large : '',
+                rating: data.rating && data.rating.score ? data.rating.score : null,
+                status: subjectDate && subjectDate > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
+                airDate: publishDate || subjectDate || '',
+                url: bangumiLinkUrl,
+                infobox: infobox,
+                isbn: isbn,
+                pages: pages,
+                authors: authors,
+                links: [{ label: 'Bangumi', url: bangumiLinkUrl }]
+            };
+
+            if (debug) console.log('[KomgaScraper] [Bangumi] Detail result:', JSON.stringify(detail, null, 2));
+            return detail;
+
+        } catch (e) {
+            console.error('[KomgaScraper] [Bangumi] Failed to fetch subject detail:', e);
+            return null;
         }
     }
 
@@ -735,6 +993,11 @@
 
     function showSuccess(fields, onRefresh) {
         closeAllModals();
+        const config = getConfig();
+        const shouldAutoRefresh = config.autoRefresh !== false;
+        const autoRefreshMsg = shouldAutoRefresh
+            ? '页面将在 2 秒后自动刷新...'
+            : '自动刷新已关闭，可手动点击刷新按钮';
         const contentHtml = `
             <div style="padding:10px 0;">
                 <div style="text-align:center;font-size:48px;margin-bottom:16px;">✅</div>
@@ -745,7 +1008,7 @@
                         ${fields.map(function(f) { return '<span style="display:inline-block;background:rgba(76,175,80,0.2);color:#4caf50;padding:4px 10px;border-radius:6px;font-size:13px;margin:4px 4px 4px 0;">' + f + '</span>'; }).join('')}
                     </div>
                 ` : ''}
-                <div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;">页面将在 2 秒后自动刷新...</div>
+                <div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;">${autoRefreshMsg}</div>
                 <div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">
                     <button class="ks-btn ks-btn-secondary" id="ks-close-btn-2">关闭</button>
                     <button class="ks-btn ks-btn-primary" id="ks-refresh-btn">立即刷新</button>
@@ -773,12 +1036,14 @@
             }
         };
 
-        setTimeout(function() {
-            if (document.body.contains(modal)) {
-                modal.remove();
-                window.location.reload();
-            }
-        }, 2000);
+        if (shouldAutoRefresh) {
+            setTimeout(function() {
+                if (document.body.contains(modal)) {
+                    modal.remove();
+                    window.location.reload();
+                }
+            }, 2000);
+        }
     }
 
     // ============================================================
@@ -912,7 +1177,12 @@
 
         if (pageType === 'book') {
             fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !isFieldLocked('releaseDate') && !!mappedMetadata.releaseDate, locked: isFieldLocked('releaseDate') });
+            fields.push({ key: 'isbn', label: 'ISBN', type: 'text', value: mappedMetadata.isbn || '', checked: !isFieldLocked('isbn') && !!mappedMetadata.isbn, locked: isFieldLocked('isbn') });
+            fields.push({ key: 'pages', label: '页数', type: 'text', value: mappedMetadata.pages || '', checked: !isFieldLocked('pages') && !!mappedMetadata.pages, locked: isFieldLocked('pages') });
         }
+
+        const hasAuthors = mappedMetadata.authors && mappedMetadata.authors.length > 0;
+        const hasLinks = scrapeResult.links && scrapeResult.links.length > 0;
 
         let previewHtml = '<div style="padding:4px 0;">';
 
@@ -971,6 +1241,28 @@
             `;
         });
 
+        if (hasAuthors) {
+            const authorLocked = currentMetadata.authorsLock === true;
+            previewHtml += `
+                <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
+                        <input type="checkbox" class="ks-author-checkbox" ${authorLocked ? 'disabled' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                        <span style="color:#fff;font-size:14px;font-weight:500;">作者 / 作画${authorLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
+                    </label>
+            `;
+            mappedMetadata.authors.forEach(function(a, idx) {
+                const safeName = String(a.name || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+                const safeRole = a.role === 'artist' ? '作画' : '作者';
+                previewHtml += `
+                    <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
+                        <span style="color:rgba(255,255,255,0.6);font-size:12px;width:40px;flex-shrink:0;">${safeRole}</span>
+                        <input type="text" class="ks-author-input" data-role="${a.role}" data-idx="${idx}" value="${safeName}" ${authorLocked ? 'disabled' : ''} style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                    </div>
+                `;
+            });
+            previewHtml += `</div>`;
+        }
+
         previewHtml += `
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1);">
                 <button class="ks-btn ks-btn-secondary" id="ks-cancel-btn">取消</button>
@@ -1003,6 +1295,7 @@
             const selectedFields = {};
             const updatedFields = [];
             const skippedFields = [];
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -1017,15 +1310,39 @@
                     const input = modal.querySelector('.ks-field-input[data-field="' + fieldKey + '"]');
                     if (input) {
                         selectedFields[fieldKey] = input.value;
-                        const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期' };
                         updatedFields.push(fieldLabels[fieldKey] || fieldKey);
                     }
                 }
             });
 
+            if (hasAuthors) {
+                const authorCb = modal.querySelector('.ks-author-checkbox');
+                if (authorCb && authorCb.checked) {
+                    const authorInputs = modal.querySelectorAll('.ks-author-input');
+                    const collectedAuthors = [];
+                    authorInputs.forEach(function(inp) {
+                        const nm = String(inp.value || '').trim();
+                        if (nm) {
+                            collectedAuthors.push({ name: nm, role: inp.getAttribute('data-role') || 'writer' });
+                        }
+                    });
+                    if (collectedAuthors.length > 0) {
+                        selectedFields.authors = collectedAuthors;
+                        updatedFields.push('作者');
+                    }
+                }
+            }
+
+            if (hasLinks) {
+                selectedFields.links = scrapeResult.links;
+                updatedFields.push('来源链接');
+            }
+
             if (config.debug && skippedFields.length > 0) {
                 console.log('[KomgaScraper] Skipped locked fields:', skippedFields);
             }
+
+            if (config.debug) console.log('[KomgaScraper] Selected fields for update:', selectedFields);
 
             modal.remove();
             onConfirm(selectedFields, updatedFields);
@@ -1052,6 +1369,13 @@
                     <span style="color:rgba(255,255,255,0.7);font-size:13px;">毫秒 (ms)</span>
                 </div>
                 <div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:4px;">默认 2000 毫秒，最小值 500 毫秒。<br>提高频率限制可防止被 Ban，降低可加快刮削速度。</div>
+            </div>
+
+            <div style="margin-bottom:20px;">
+                <div style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="ks-setting-auto-refresh" ${config.autoRefresh ? 'checked' : ''} style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
+                    <label for="ks-setting-auto-refresh" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">刮削成功后自动刷新页面</label>
+                </div>
             </div>
 
             <div style="margin-bottom:20px;">
@@ -1094,6 +1418,7 @@
         document.getElementById('ks-save-btn').onclick = function() {
             const newConfig = getConfig();
             newConfig.rateLimit.minInterval = parseInt(document.getElementById('ks-setting-rate-limit').value) || 2000;
+            newConfig.autoRefresh = document.getElementById('ks-setting-auto-refresh').checked;
             newConfig.debug = document.getElementById('ks-setting-debug').checked;
 
             saveConfig(newConfig);
@@ -1177,8 +1502,24 @@
 
             loading.remove();
 
-            showSearchResults(searchResults, function(selectedResult) {
-                showMetadataPreview(selectedResult, currentData, pageType, function(selectedFields, updatedFields) {
+            showSearchResults(searchResults, async function(selectedResult) {
+                showLoading('正在获取详细数据...');
+                const detail = await fetchSubjectDetail(selectedResult.id);
+                closeAllModals();
+
+                if (!detail) {
+                    showError('获取详情失败', '无法获取详细数据，将使用搜索结果');
+                    showMetadataPreview(selectedResult, currentData, pageType, function(selectedFields, updatedFields) {
+                        if (Object.keys(selectedFields).length === 0) {
+                            showError('未选择任何字段', '请至少勾选一个要更新的字段');
+                            return;
+                        }
+                        writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData);
+                    });
+                    return;
+                }
+
+                showMetadataPreview(detail, currentData, pageType, function(selectedFields, updatedFields) {
                     if (Object.keys(selectedFields).length === 0) {
                         showError('未选择任何字段', '请至少勾选一个要更新的字段');
                         return;
@@ -1201,23 +1542,102 @@
             const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
             const finalMetadata = {};
             const finalUpdated = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期' };
+            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接' };
+
+            if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
             Object.keys(metadata).forEach(function(key) {
+                const value = metadata[key];
+
+                if (key === 'pages') return;
                 if (currentMetadata[key + 'Lock'] === true) {
                     if (config.debug) console.log('[KomgaScraper] Skipping locked field:', key);
                     return;
                 }
-                finalMetadata[key] = metadata[key];
+
+                if (key === 'links') {
+                    if (Array.isArray(value) && value.length > 0) {
+                        const cleanedLinks = value.map(function(link) {
+                            return {
+                                label: String(link.label || '').trim(),
+                                url: cleanUrl(link.url)
+                            };
+                        }).filter(function(link) { return link.url; });
+                        if (cleanedLinks.length > 0) {
+                            finalMetadata.links = cleanedLinks;
+                            finalUpdated.push(fieldLabels.links || 'links');
+                        }
+                    }
+                    return;
+                }
+
+                if (key === 'authors') {
+                    if (Array.isArray(value) && value.length > 0) {
+                        const validAuthors = value.filter(function(au) {
+                            if (!au || !au.name) return false;
+                            const nm = String(au.name).trim();
+                            return nm.length > 0 && nm.length <= 100 && !looksLikeDate(nm);
+                        }).map(function(au) {
+                            return { name: String(au.name).trim(), role: au.role || 'writer' };
+                        });
+                        if (validAuthors.length > 0) {
+                            finalMetadata.authors = validAuthors;
+                            finalUpdated.push(fieldLabels.author || 'author');
+                        }
+                    }
+                    return;
+                }
+
+                if (key === 'author') {
+                    if (value && typeof value === 'string') {
+                        const authorName = String(value).trim();
+                        if (authorName && !looksLikeDate(authorName) && authorName.length <= 50) {
+                            finalMetadata.authors = [{ name: authorName, role: 'writer' }];
+                            finalUpdated.push(fieldLabels.author || 'author');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid author value:', value);
+                        }
+                    }
+                    return;
+                }
+
+                if (key === 'releaseDate') {
+                    if (value && typeof value === 'string' && looksLikeDate(value)) {
+                        finalMetadata.releaseDate = String(value).trim();
+                        finalUpdated.push(fieldLabels.releaseDate || 'releaseDate');
+                    } else if (config.debug) {
+                        console.log('[KomgaScraper] Skipping invalid releaseDate value:', value);
+                    }
+                    return;
+                }
+
+                if (key === 'isbn') {
+                    if (value && typeof value === 'string') {
+                        const cleanIsbn = value.replace(/[^0-9]/g, '');
+                        if (cleanIsbn.length >= 10) {
+                            finalMetadata.isbn = cleanIsbn;
+                            finalUpdated.push(fieldLabels.isbn || 'isbn');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid ISBN value:', value);
+                        }
+                    }
+                    return;
+                }
+
+                if (typeof value === 'string') {
+                    finalMetadata[key] = value.trim();
+                } else {
+                    finalMetadata[key] = value;
+                }
                 finalUpdated.push(fieldLabels[key] || key);
             });
 
             if (Object.keys(finalMetadata).length === 0) {
-                showError('无可用字段', '所有勾选的字段都已被锁定，无法写入');
+                showError('无可用字段', '所有勾选的字段都已被锁定或包含无效值，无法写入');
                 return;
             }
 
-            if (config.debug) console.log('[KomgaScraper] Writing metadata to Komga:', finalMetadata);
+            if (config.debug) console.log('[KomgaScraper] Writing metadata to Komga:', JSON.stringify(finalMetadata, null, 2));
 
             showLoading('正在写入元数据到 Komga...');
 
