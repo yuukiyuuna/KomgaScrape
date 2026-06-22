@@ -606,15 +606,6 @@
         const infoboxStatus = extractStatusFromInfobox(bangumiData.infobox);
         newMetadata.status = infoboxStatus || mapBangumiStatus(bangumiData.status) || metadata.status;
 
-        if (bangumiData.rating) {
-            newMetadata.summary = (newMetadata.summary || '') + '\n\n评分: ' + bangumiData.rating;
-        }
-
-        if (bangumiData.authors && bangumiData.authors.length > 0) {
-            newMetadata.authors = bangumiData.authors;
-        } else if (bangumiData.author) {
-            newMetadata.authors = [{ name: bangumiData.author, role: 'writer' }];
-        }
         if (bangumiData.links && bangumiData.links.length > 0) {
             newMetadata.links = bangumiData.links;
         }
@@ -631,18 +622,13 @@
         const fallbackTitle = isZh ? bangumiData.originalTitle : bangumiData.title;
         newMetadata.title = preferredTitle || fallbackTitle || metadata.title;
 
-        let summaryExtra = '';
-        if (bangumiData.pages) {
-            summaryExtra += '\n\n页数: ' + bangumiData.pages;
-        }
-        newMetadata.summary = (bangumiData.summary || metadata.summary || '') + summaryExtra;
+        newMetadata.summary = bangumiData.summary || metadata.summary;
         if (!newMetadata.summary) delete newMetadata.summary;
 
         newMetadata.releaseDate = bangumiData.airDate || metadata.releaseDate;
 
         const normalizedIsbn = normalizeIsbn(bangumiData.isbn);
         if (normalizedIsbn) newMetadata.isbn = normalizedIsbn;
-        if (bangumiData.pages) newMetadata.pages = bangumiData.pages;
         if (bangumiData.authors && bangumiData.authors.length > 0) {
             newMetadata.authors = bangumiData.authors;
         } else if (bangumiData.author) {
@@ -1165,10 +1151,6 @@
         newMetadata.summary = fanzaData.summary || metadata.summary;
         newMetadata.status = 'ENDED';
 
-        if (fanzaData.authors && fanzaData.authors.length > 0) {
-            newMetadata.authors = fanzaData.authors;
-        }
-
         if (fanzaData.tags && fanzaData.tags.length > 0) {
             newMetadata.tags = fanzaData.tags;
         }
@@ -1189,10 +1171,6 @@
 
         if (fanzaData.releaseDate) {
             newMetadata.releaseDate = fanzaData.releaseDate;
-        }
-
-        if (fanzaData.pages) {
-            newMetadata.pages = fanzaData.pages;
         }
 
         if (fanzaData.authors && fanzaData.authors.length > 0) {
@@ -1682,14 +1660,21 @@
 
         const fields = [
             { key: 'title', label: '标题', type: 'text', value: mappedMetadata.title || '', checked: !isFieldLocked('title'), locked: isFieldLocked('title') },
-            { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: !isFieldLocked('summary'), locked: isFieldLocked('summary') },
-            { key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') }
+            { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: !isFieldLocked('summary'), locked: isFieldLocked('summary') }
         ];
 
+        if (pageType === 'series') {
+            fields.push({ key: 'titleSort', label: '排序标题', type: 'text', value: currentMetadata.titleSort || mappedMetadata.titleSort || mappedMetadata.title || '', checked: !isFieldLocked('titleSort'), locked: isFieldLocked('titleSort') });
+            fields.push({ key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') });
+        }
+
         if (pageType === 'book') {
+            const currentNumber = currentData != null && currentData.number != null ? String(currentData.number) : '';
+            const currentNumberSort = currentData != null && currentData.numberSort != null ? String(currentData.numberSort) : (currentMetadata.numberSort || currentNumber);
+            fields.push({ key: 'number', label: '序号', type: 'text', value: currentNumber, checked: !isFieldLocked('number') && !!currentNumber, locked: isFieldLocked('number') });
+            fields.push({ key: 'numberSort', label: '排序序号', type: 'text', value: currentNumberSort, checked: !isFieldLocked('numberSort') && !!currentNumberSort, locked: isFieldLocked('numberSort') });
             fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !isFieldLocked('releaseDate') && !!mappedMetadata.releaseDate, locked: isFieldLocked('releaseDate') });
             fields.push({ key: 'isbn', label: 'ISBN', type: 'text', value: mappedMetadata.isbn || '', checked: !isFieldLocked('isbn') && !!mappedMetadata.isbn, locked: isFieldLocked('isbn') });
-            fields.push({ key: 'pages', label: '页数', type: 'text', value: mappedMetadata.pages || '', checked: !isFieldLocked('pages') && !!mappedMetadata.pages, locked: isFieldLocked('pages') });
         }
 
         const hasAuthors = mappedMetadata.authors && mappedMetadata.authors.length > 0;
@@ -1853,7 +1838,7 @@
             const selectedFields = {};
             const updatedFields = [];
             const skippedFields = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -2171,7 +2156,7 @@
             const finalMetadata = {};
             const finalUpdated = [];
             const writtenScalarKeys = [];
-            const fieldLabels = { title: '标题', summary: '简介', status: '状态', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向' };
 
             if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
@@ -2207,6 +2192,7 @@
                         if (validAuthors.length > 0) {
                             finalMetadata.authors = validAuthors;
                             finalUpdated.push(fieldLabels.author || 'author');
+                            writtenScalarKeys.push('authors');
                         }
                     }
                     return;
@@ -2218,6 +2204,7 @@
                         if (authorName && !looksLikeDate(authorName) && authorName.length <= 50) {
                             finalMetadata.authors = [{ name: authorName, role: 'writer' }];
                             finalUpdated.push(fieldLabels.author || 'author');
+                            writtenScalarKeys.push('authors');
                         } else if (config.debug) {
                             console.log('[KomgaScraper] Skipping invalid author value:', value);
                         }
@@ -3022,15 +3009,6 @@
         const infoboxStatus = extractStatusFromInfobox(bangumiData.infobox);
         newMetadata.status = infoboxStatus || mapBangumiStatus(bangumiData.status) || metadata.status;
 
-        if (bangumiData.rating) {
-            newMetadata.summary = (newMetadata.summary || '') + '\n\n评分: ' + bangumiData.rating;
-        }
-
-        if (bangumiData.authors && bangumiData.authors.length > 0) {
-            newMetadata.authors = bangumiData.authors;
-        } else if (bangumiData.author) {
-            newMetadata.authors = [{ name: bangumiData.author, role: 'writer' }];
-        }
         if (bangumiData.links && bangumiData.links.length > 0) {
             newMetadata.links = bangumiData.links;
         }
@@ -3047,18 +3025,13 @@
         const fallbackTitle = isZh ? bangumiData.originalTitle : bangumiData.title;
         newMetadata.title = preferredTitle || fallbackTitle || metadata.title;
 
-        let summaryExtra = '';
-        if (bangumiData.pages) {
-            summaryExtra += '\n\n页数: ' + bangumiData.pages;
-        }
-        newMetadata.summary = (bangumiData.summary || metadata.summary || '') + summaryExtra;
+        newMetadata.summary = bangumiData.summary || metadata.summary;
         if (!newMetadata.summary) delete newMetadata.summary;
 
         newMetadata.releaseDate = bangumiData.airDate || metadata.releaseDate;
 
         const normalizedIsbn = normalizeIsbn(bangumiData.isbn);
         if (normalizedIsbn) newMetadata.isbn = normalizedIsbn;
-        if (bangumiData.pages) newMetadata.pages = bangumiData.pages;
         if (bangumiData.authors && bangumiData.authors.length > 0) {
             newMetadata.authors = bangumiData.authors;
         } else if (bangumiData.author) {
@@ -3630,14 +3603,21 @@
 
         const fields = [
             { key: 'title', label: '标题', type: 'text', value: mappedMetadata.title || '', checked: !isFieldLocked('title'), locked: isFieldLocked('title') },
-            { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: !isFieldLocked('summary'), locked: isFieldLocked('summary') },
-            { key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') }
+            { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: !isFieldLocked('summary'), locked: isFieldLocked('summary') }
         ];
 
+        if (pageType === 'series') {
+            fields.push({ key: 'titleSort', label: '排序标题', type: 'text', value: currentMetadata.titleSort || mappedMetadata.titleSort || mappedMetadata.title || '', checked: !isFieldLocked('titleSort'), locked: isFieldLocked('titleSort') });
+            fields.push({ key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') });
+        }
+
         if (pageType === 'book') {
+            const currentNumber = currentData != null && currentData.number != null ? String(currentData.number) : '';
+            const currentNumberSort = currentData != null && currentData.numberSort != null ? String(currentData.numberSort) : (currentMetadata.numberSort || currentNumber);
+            fields.push({ key: 'number', label: '序号', type: 'text', value: currentNumber, checked: !isFieldLocked('number') && !!currentNumber, locked: isFieldLocked('number') });
+            fields.push({ key: 'numberSort', label: '排序序号', type: 'text', value: currentNumberSort, checked: !isFieldLocked('numberSort') && !!currentNumberSort, locked: isFieldLocked('numberSort') });
             fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !isFieldLocked('releaseDate') && !!mappedMetadata.releaseDate, locked: isFieldLocked('releaseDate') });
             fields.push({ key: 'isbn', label: 'ISBN', type: 'text', value: mappedMetadata.isbn || '', checked: !isFieldLocked('isbn') && !!mappedMetadata.isbn, locked: isFieldLocked('isbn') });
-            fields.push({ key: 'pages', label: '页数', type: 'text', value: mappedMetadata.pages || '', checked: !isFieldLocked('pages') && !!mappedMetadata.pages, locked: isFieldLocked('pages') });
         }
 
         const hasAuthors = mappedMetadata.authors && mappedMetadata.authors.length > 0;
@@ -4081,6 +4061,7 @@
                         if (validAuthors.length > 0) {
                             finalMetadata.authors = validAuthors;
                             finalUpdated.push(fieldLabels.author || 'author');
+                            writtenScalarKeys.push('authors');
                         }
                     }
                     return;
@@ -4092,6 +4073,7 @@
                         if (authorName && !looksLikeDate(authorName) && authorName.length <= 50) {
                             finalMetadata.authors = [{ name: authorName, role: 'writer' }];
                             finalUpdated.push(fieldLabels.author || 'author');
+                            writtenScalarKeys.push('authors');
                         } else if (config.debug) {
                             console.log('[KomgaScraper] Skipping invalid author value:', value);
                         }
