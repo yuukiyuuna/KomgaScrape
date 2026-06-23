@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.2
+// @version      1.2.3
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -10,23 +10,34 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
-// @connect      *
-// @connect      api.bgm.tv
-// @connect      *.bgm.tv
-// @connect      bangumi.tv
-// @connect      *.bangumi.tv
-// @connect      mangadex.org
-// @connect      *.mangadex.org
-// @connect      graphql.anilist.co
-// @connect      anilist.co
-// @connect      www.dmm.co.jp
-// @connect      *.dmm.co.jp
-// @connect      dmm.co.jp
-// @connect      doujin-assets.dmm.co.jp
+// —— 脚本实际对外请求的域名（给 AI Agent 看：新增数据源时请在此添加对应 @connect）——
+// @connect      bgm.tv         # Bangumi 条目/详情 API
+// @connect      *.bgm.tv         # Bangumi 条目/详情 API
+// @connect      dmm.co.jp      # DMM / Fanza 搜索、详情页与站内图片
+// @connect      *.dmm.co.jp      # DMM / Fanza 搜索、详情页与站内图片
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js
 // @run-at       document-end
 // @sandbox      JavaScript
 // ==/UserScript==
+
+/*
+ * ============================================================
+ *  版本号约定（给后续修改此脚本的 AI / 开发者看）
+ * ============================================================
+ *  · 本文件中版本号只有一个真实来源：上方元数据块中的 @version
+ *  · 脚本运行时通过 GM_info.script.version 读取该值，
+ *    再赋值给 SCRIPT_VERSION 常量（见 getScriptVersion()）
+ *  · SCRIPT_VERSION 被用于：
+ *      1) defaultConfig.version       —— 写入配置默认值，判断配置是否为旧版本遗留
+ *      2) checkConfigVersion()        —— 脚本升级后对旧配置做迁移 / 重置
+ *      3) BANGUMI_USER_AGENT          —— 对外 API 请求的 UA 标识
+ *      4) 启动 / 初始化日志            —— 控制台版本标识，方便排障
+ *  · 禁止在脚本任何位置再出现 '1.x.x' 之类的硬编码版本字符串！
+ *    升级版本时只改顶部 @version 一行，其它地方自动同步。
+ *  · 勿删除或改写 getScriptVersion() / SCRIPT_VERSION，
+ *    否则配置版本迁移逻辑与 UA 都会失去版本来源。
+ * ============================================================
+ */
 
 (function() {
     'use strict';
@@ -36,7 +47,27 @@
     // ============================================================
 
     const CONFIG_KEY = 'komga_scraper_config';
-    const SCRIPT_VERSION = '1.2.2';
+
+    /**
+     * 从元数据块的 @version 中解析版本号（单一来源，避免多处硬编码不同步）
+     * 注意：Tampermonkey/Violentmonkey 通过 GM_info.script.version 提供 @version 值；
+     * 若环境不支持，则回退为 '0.0.0'，以便于本地测试。
+     *
+     * 【给 AI Agent 的修改约定】
+     * · 版本号只在脚本顶部 // @version 处维护，这里不要再写死任何版本字符串。
+     * · SCRIPT_VERSION 用于 defaultConfig.version / checkConfigVersion()
+     *   / BANGUMI_USER_AGENT / 启动日志，切勿删除或改写此函数与常量。
+     * · 若要升级版本，仅修改顶部 // @version 一行的值即可，其它地方自动同步。
+     */
+    function getScriptVersion() {
+        try {
+            if (typeof GM_info !== 'undefined' && GM_info && GM_info.script && GM_info.script.version) {
+                return String(GM_info.script.version);
+            }
+        } catch (_) { }
+        return '0.0.0';
+    }
+    const SCRIPT_VERSION = getScriptVersion();
 
     const defaultConfig = {
         version: SCRIPT_VERSION,
@@ -84,6 +115,8 @@
         }
     }
 
+    // 【给 AI Agent 看】此处使用 SCRIPT_VERSION 判断配置版本是否过时；
+    // 请勿把具体版本号写死在这里，也请勿改写 getScriptVersion()。
     function checkConfigVersion() {
         const config = getConfig();
         if (!config.version || config.version !== SCRIPT_VERSION) {
@@ -287,6 +320,14 @@
     // ============================================================
     // 5. Komga API 模块
     // ============================================================
+    // Komga API 文档： https://komga.org/docs/api/rest/
+    // 本脚本从 window.location.origin 动态取基础地址；
+    // 常用接口（便于 agent 直接调用测试，{origin} 替换为你的 Komga 站点）：
+    //   - 系列详情：  GET {origin}/api/v1/series/{seriesId}
+    //   - 书籍详情：  GET {origin}/api/v1/books/{bookId}
+    //   - 系列下书籍：GET {origin}/api/v1/series/{seriesId}/books?size=500
+    //   - 系列元数据：PATCH {origin}/api/v1/series/{seriesId}/metadata
+    //   - 书籍元数据：PATCH {origin}/api/v1/books/{bookId}/metadata
 
     function getKomgaBaseUrl() {
         return window.location.origin;
@@ -676,8 +717,16 @@
     // 7. Bangumi 刮削源
     // ============================================================
 
+    // Bangumi API 文档： https://bangumi.github.io/api/
+    // 常用接口（便于 agent 直接调用测试）：
+    //   - 搜索条目：   POST https://api.bgm.tv/v0/search/subjects?limit=10
+    //                  body: {"keyword":"xxx","sort":"rank"}
+    //   - 系列章节：   GET  https://api.bgm.tv/v0/subjects/{subjectId}/subjects
+    //   - 章节详情：   GET  https://api.bgm.tv/v0/subjects/{subjectId}
     const BANGUMI_API_BASE = 'https://api.bgm.tv';
-    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/1.2.2 (https://github.com/yourname/komga-scraper)';
+    // 【给 AI Agent 看】UA 中版本号必须从 SCRIPT_VERSION 读取；
+    // 不要在此处写死 '1.x.x' 之类的具体版本号。
+    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/' + SCRIPT_VERSION + ' (https://github.com/yourname/komga-scraper)';
 
     async function scrapeFromBangumi(keyword) {
         try {
