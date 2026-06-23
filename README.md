@@ -38,15 +38,19 @@
 
 ### 2. 自动刮削（仅 Bangumi，仅限系列页）
 
-1. 在系列详情页，先**执行一次手动刮削**（或手动在该系列元数据中加入 `links` 链接形如 `https://bgm.tv/subject/{id}`），让脚本知道该系列对应的 Bangumi subject id。
-2. 点击 “自动刮削” 按钮。脚本会：
-   - 从 `GET https://api.bgm.tv/v0/subjects/{seriesSubjectId}/subjects` 读取该系列下所有卷 / 分册；
-   - 对每一卷再调用 `GET https://api.bgm.tv/v0/subjects/{id}` 拉取详细字段；
-   - 按 Komga 书籍的 `number`（卷号）与 Bangumi 条目中解析出的卷号匹配；
-   - 对匹配成功的每本书籍，直接 PATCH 到 Komga 的 `books/{id}/metadata` 并加锁；
-   - 最后展示一个“成功 / 跳过 / 失败”的统计浮层。
+**前置条件：** 该系列必须先被手动刮削过（或手动在 metadata.links 中添加 `https://bgm.tv/subject/{id}` 的链接），这样脚本才能知道它在 Bangumi 上的 subject id。
 
-匹配规则简单：**Komga 的 `number` 与 Bangumi 标题中出现的整数（优先匹配 “第 N 卷” / “Vol.N” 等字样）完全相等才被写入**。匹配不上的书籍会被报告为“跳过”，不会被动写入。
+**步骤：**
+1. 进入系列详情页，点击 "自动刮削" 按钮。
+2. 脚本先读取该系列下的全部书籍，再从 `GET https://api.bgm.tv/v0/subjects/{seriesSubjectId}/subjects` 读取系列中的分卷 / 章节条目。
+3. 弹出**确认对话框**，显示系列名、书籍总数、匹配数、跳过数。点击 "开始" 进入批处理。
+4. 逐本进行：按 Komga 书籍的 `number`（卷号）与 Bangumi 条目中解析出的卷号匹配；匹配成功后调用 `GET https://api.bgm.tv/v0/subjects/{id}` 拉取详细元数据，**直接写入并加锁**（不再要求手动确认）。
+5. 每本书的详情拉取失败会自动**最多重试 2 次**（间隔 1.5 秒）。
+6. 最后弹出**汇总对话框**：成功写入 / 跳过（未匹配） / 失败 / 总计。
+
+**匹配规则：** 优先匹配 Bangumi 标题中明确标识的 "第 N 卷" / "Vol.N" / "Volume N"；未找到时再取标题里出现的首个整数（1–999 之间，排除像年份这样的误匹配）。Komga 的 `number` 必须**完全相等**才会被写入。不匹配的书籍会报告为"跳过"，不会被动写入。
+
+**字段加锁策略：** 自动刮削写入的所有字段（title、summary、releaseDate、isbn、authors、links、number、numberSort 等）会被自动附加 `*Lock=true`，避免被 Komga 内置扫描覆盖。
 
 ### 3. 快捷键
 

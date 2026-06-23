@@ -909,18 +909,29 @@
         for (let i = 0; i < candidates.length; i++) {
             const text = String(candidates[i] || '');
             if (!text) continue;
-            // 优先匹配“第 N 卷 / 第 N 话 / Vol.N”之类
+            // 优先匹配“第 N 卷 / 第 N 话 / Vol.N”之类的明确标识
             const explicit = text.match(/(?:第|Vol\.?|Volume|卷|话)\s*([0-9]+)/i);
             if (explicit && explicit[1]) {
-                return parseInt(explicit[1], 10);
+                const vol = parseInt(explicit[1], 10);
+                if (vol > 0 && vol <= 999) return vol;
             }
-            // 退而求其次：文本里出现的首个纯数字（整数）
+            // 退而求其次：文本中首个合理数字（1-3 位，排除 19xx/20xx 年份）
             const m = text.match(/(?:^|[^0-9.])([0-9]+)(?:[^0-9.]|$)/);
             if (m && m[1]) {
-                return parseInt(m[1], 10);
+                const digits = m[1];
+                if (digits.length >= 1 && digits.length <= 3) {
+                    const val = parseInt(digits, 10);
+                    if (val > 0 && val <= 999) return val;
+                }
             }
             const m2 = text.match(/^([0-9]+)$/);
-            if (m2) return parseInt(m2[1], 10);
+            if (m2 && m2[1]) {
+                const digits = m2[1];
+                if (digits.length >= 1 && digits.length <= 3) {
+                    const val = parseInt(digits, 10);
+                    if (val > 0 && val <= 999) return val;
+                }
+            }
         }
         return null;
     }
@@ -1381,6 +1392,32 @@
     // 9. 模态框工具模块
     // ============================================================
 
+    let __ksStylesInjected = false;
+    function injectCommonStyles() {
+        if (__ksStylesInjected) return;
+        const style = document.createElement('style');
+        style.id = 'ks-common-styles';
+        style.textContent = [
+            '.ks-btn { border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }',
+            '.ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;font-weight:500; }',
+            '.ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }',
+            '.ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }',
+            '.ks-btn-secondary:hover { background:rgba(255,255,255,0.15); }',
+            '.ks-btn-block { width:100%; }',
+            '.ks-source-card:hover { background:rgba(255,255,255,0.1); border-color:rgba(100,200,255,0.3); transform:translateY(-2px); }',
+            '.ks-result-card:hover { background:rgba(255,255,255,0.1); border-color:rgba(100,200,255,0.3); transform:translateY(-2px); }',
+            '.ks-field-row:hover { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.1); }',
+            '.ks-field-row:hover .ks-field-input { border-color:rgba(102,126,234,0.3); }',
+            '.ks-field-input:focus { outline:none; border-color:#667eea !important; box-shadow:0 0 0 2px rgba(102,126,234,0.2); }',
+            '@keyframes ks-spin { to { transform: rotate(360deg); } }',
+            '.ks-btn-retry { background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.8); }',
+            '.ks-btn-retry:hover { background:rgba(255,255,255,0.15); }',
+            '.ks-result-card:hover, .ks-source-card, .ks-field-row { transition: all 0.3s ease; }'
+        ].join('\n');
+        document.head.appendChild(style);
+        __ksStylesInjected = true;
+    }
+
     const MODAL_Z_INDEX = 10000;
 
     function createModalBase(title, contentHtml, onClose) {
@@ -1436,17 +1473,20 @@
         });
     }
 
-    function showLoading(message) {
+    function showLoading(message, progress) {
         closeAllModals();
-        const contentHtml = `
-            <div style="text-align:center;padding:20px;">
-                <div style="width:48px;height:48px;margin:0 auto 16px;border:4px solid rgba(255,255,255,0.1);border-top-color:#667eea;border-radius:50%;animation:ks-spin 1s linear infinite;"></div>
-                <div style="color:#fff;font-size:16px;margin-bottom:8px;">${message || '加载中...'}</div>
-            </div>
-            <style>
-                @keyframes ks-spin { to { transform: rotate(360deg); } }
-            </style>
-        `;
+        const hasProgress = progress && typeof progress.processed === 'number' && typeof progress.total === 'number';
+        const textMsg = message || '加载中...';
+        const contentHtml = hasProgress
+            ? '<div style="text-align:center;padding:20px;">' +
+                '<div style="width:48px;height:48px;margin:0 auto 16px;border:4px solid rgba(255,255,255,0.1);border-top-color:#667eea;border-radius:50%;animation:ks-spin 1s linear infinite;"></div>' +
+                '<div id="ks-auto-message" style="color:#fff;font-size:16px;margin-bottom:8px;">' + textMsg + '</div>' +
+                '<div id="ks-auto-progress" style="color:rgba(255,255,255,0.6);font-size:13px;">' + String(progress.processed) + '/' + String(progress.total) + '</div>' +
+              '</div>'
+            : '<div style="text-align:center;padding:20px;">' +
+                '<div style="width:48px;height:48px;margin:0 auto 16px;border:4px solid rgba(255,255,255,0.1);border-top-color:#667eea;border-radius:50%;animation:ks-spin 1s linear infinite;"></div>' +
+                '<div style="color:#fff;font-size:16px;margin-bottom:8px;">' + textMsg + '</div>' +
+              '</div>';
         return createModalBase('请稍候', contentHtml, null);
     }
 
@@ -1462,13 +1502,6 @@
                     <button class="ks-btn ks-btn-secondary" id="ks-close-btn">关闭</button>
                 </div>
             </div>
-            <style>
-                .ks-btn { border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }
-                .ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff; }
-                .ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }
-                .ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }
-                .ks-btn-secondary:hover { background:rgba(255,255,255,0.15); }
-            </style>
         `;
         const modal = createModalBase('错误', contentHtml, null);
 
@@ -1508,13 +1541,6 @@
                     <button class="ks-btn ks-btn-primary" id="ks-refresh-btn">立即刷新</button>
                 </div>
             </div>
-            <style>
-                .ks-btn { border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }
-                .ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;font-weight:500; }
-                .ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }
-                .ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }
-                .ks-btn-secondary:hover { background:rgba(255,255,255,0.15); }
-            </style>
         `;
         const modal = createModalBase('成功', contentHtml, null);
 
@@ -1571,12 +1597,6 @@
 
                 <div style="color:rgba(255,255,255,0.4);font-size:13px;text-align:center;margin:16px 0 8px 0;">更多数据源 (MangaDex, AniList) 即将推出...</div>
             </div>
-            <style>
-                .ks-source-card:hover { background:rgba(255,255,255,0.1); border-color:rgba(100,200,255,0.3); transform:translateY(-2px); }
-                .ks-btn { border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }
-                .ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff; }
-                .ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }
-            </style>
         `;
 
         const modal = createModalBase('选择刮削源', contentHtml, null);
@@ -1624,13 +1644,6 @@
                         <button class="ks-btn ks-btn-secondary" id="ks-cancel-btn">取消</button>
                     </div>
                 </div>
-                <style>
-                    .ks-btn { border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }
-                    .ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff; }
-                    .ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }
-                    .ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }
-                    .ks-btn-secondary:hover { background:rgba(255,255,255,0.15); }
-                </style>
             `;
             const modal = createModalBase('未找到结果 — 手动修改搜索词', retryHtml, null);
 
@@ -1707,12 +1720,6 @@
                 </div>
             `;
         }
-        resultsHtml += `
-            <style>
-                .ks-result-card:hover { background:rgba(255,255,255,0.1); border-color:rgba(100,200,255,0.3); transform:translateY(-2px); }
-                .ks-btn-retry:hover { background:rgba(255,255,255,0.15); }
-            </style>
-        `;
 
         const modal = createModalBase('搜索结果', resultsHtml, null);
 
@@ -1916,18 +1923,6 @@
         `;
 
         previewHtml += '</div>';
-        previewHtml += `
-            <style>
-                .ks-field-row:hover { background:rgba(255,255,255,0.05); border-color:rgba(255,255,255,0.1); }
-                .ks-field-row:hover .ks-field-input { border-color:rgba(102,126,234,0.3); }
-                .ks-field-input:focus { outline:none; border-color:#667eea !important; box-shadow:0 0 0 2px rgba(102,126,234,0.2); }
-                .ks-btn { border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }
-                .ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;font-weight:500; }
-                .ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }
-                .ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }
-                .ks-btn-secondary:hover { background:rgba(255,255,255,0.15); }
-            </style>
-        `;
 
         const modal = createModalBase('预览并编辑元数据', previewHtml, null);
 
@@ -2067,15 +2062,6 @@
         `;
 
         settingsHtml += '</div>';
-        settingsHtml += `
-            <style>
-                .ks-btn { border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }
-                .ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;font-weight:500; }
-                .ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }
-                .ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }
-                .ks-btn-secondary:hover { background:rgba(255,255,255,0.15); }
-            </style>
-        `;
 
         const modal = createModalBase('⚙️ 刮削设置', settingsHtml, null);
 
@@ -2504,14 +2490,16 @@
 
     function updateLoadingProgress(processed, total, message) {
         try {
-            const label = document.getElementById('ks-auto-progress');
-            if (label) {
-                label.textContent = (message || '自动刮削进度') + ' ' + String(processed) + '/' + String(total);
+            const prog = document.getElementById('ks-auto-progress');
+            const msg = document.getElementById('ks-auto-message');
+            if (prog) {
+                prog.textContent = String(processed) + '/' + String(total);
+                if (msg && message) msg.textContent = message;
                 return;
             }
-            // 若还没有进度浮层，也降级为 showLoading
+            // 第一次调用还没有进度元素时，创建进度浮层
             const text = (message || '正在自动刮削') + '，已处理 ' + String(processed) + '/' + String(total);
-            if (typeof showLoading === 'function') showLoading(text);
+            showLoading(text, { processed: processed, total: total });
         } catch (_) { /* ignore */ }
     }
 
@@ -2535,12 +2523,7 @@
                         '<button class="ks-btn ks-btn-secondary" id="ks-auto-close">关闭</button>' +
                         '<button class="ks-btn ks-btn-primary" id="ks-auto-refresh">刷新页面</button>' +
                     '</div>' +
-                '</div>' +
-                '<style>' +
-                    '.ks-btn { border:none;padding:10px 24px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }' +
-                    '.ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;font-weight:500; }' +
-                    '.ks-btn-secondary { background:rgba(255,255,255,0.1);color:rgba(255,255,255,0.8); }' +
-                '</style>';
+                '</div>';
             const modal = createModalBase('自动刮削完成', contentHtml, null);
             document.getElementById('ks-auto-close').onclick = function() { modal.remove(); };
             document.getElementById('ks-auto-refresh').onclick = function() { modal.remove(); window.location.reload(); };
@@ -2550,9 +2533,41 @@
         }
     }
 
+    function showAutoScrapeConfirm(seriesTitle, totalBooks, matchedBooks, onConfirm) {
+        closeAllModals();
+        const title = String(seriesTitle || '该系列');
+        const contentHtml =
+            '<div style="padding:10px 0;">' +
+                '<div style="text-align:center;font-size:48px;margin-bottom:16px;">🤖</div>' +
+                '<div style="color:#fff;font-size:18px;font-weight:500;text-align:center;margin-bottom:12px;">开始自动刮削</div>' +
+                '<div style="color:rgba(255,255,255,0.7);font-size:14px;text-align:center;margin-bottom:16px;">' + title + '</div>' +
+                '<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:12px;margin-bottom:16px;">' +
+                    '<div style="color:rgba(255,255,255,0.8);font-size:14px;line-height:1.8;">' +
+                        '系列下书籍总数：<span style="color:#fff;font-weight:500;">' + String(totalBooks) + '</span><br/>' +
+                        'Bangumi 匹配数：<span style="color:#4caf50;font-weight:500;">' + String(matchedBooks) + '</span><br/>' +
+                        '无法匹配（跳过）：<span style="color:#ffb74d;font-weight:500;">' + String(totalBooks - matchedBooks) + '</span>' +
+                    '</div>' +
+                '</div>' +
+                '<div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;line-height:1.6;">' +
+                    '点击「开始」后将逐本抓取 Bangumi 元数据并写入 Komga；' +
+                    '所有写入的字段会自动在 Komga 中加锁，防止被内置扫描覆盖。' +
+                '</div>' +
+                '<div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">' +
+                    '<button class="ks-btn ks-btn-secondary" id="ks-as-cancel">取消</button>' +
+                    '<button class="ks-btn ks-btn-primary" id="ks-as-confirm">开始</button>' +
+                '</div>' +
+            '</div>';
+        const modal = createModalBase('自动刮削确认', contentHtml, null);
+        document.getElementById('ks-as-cancel').onclick = function() { modal.remove(); };
+        document.getElementById('ks-as-confirm').onclick = function() {
+            modal.remove();
+            onConfirm();
+        };
+    }
+
     async function startAutoScrape() {
-        // 自动刮削仅支持 Bangumi 源。Fanza/DMM 源主要是同人本，命名不规范、一般量也不多，
-        // 因此不提供自动刮削功能；如需刮取 Fanza 系列，请使用页面上的“刮削”按钮手动执行。
+        // 自动刮削仅支持 Bangumi 源。Fanza/DMM 源主要是同人本，命名不规范、数量通常较少，
+        // 不提供自动刮削功能；如需刮取 Fanza 系列请使用页面上的“刮削”按钮手动执行。
         try {
             closeAllModals();
             const config = getConfig();
@@ -2617,50 +2632,72 @@
 
             const pairs = matchBooksByNumber(komgaBooks, bangumiBooks);
             const total = pairs.length;
+            const matchedCount = pairs.filter(function(p) { return p.bangumiBook; }).length;
+            const seriesTitle = (seriesData.metadata && seriesData.metadata.title) || seriesData.name || '';
 
-            // 逐本请求详情并写入（避免并发触发限流）
-            let successCount = 0;
-            let skippedCount = 0;
-            let failedCount = 0;
-            const lastFetchedDetailById = {};
-
-            for (let i = 0; i < total; i++) {
-                const pair = pairs[i];
-                if (!pair.bangumiBook) {
-                    skippedCount++;
-                    updateLoadingProgress(i + 1, total, '自动刮削中');
-                    continue;
-                }
-
-                updateLoadingProgress(i + 1, total, '正在处理第 ' + String(i + 1) + ' 本');
-
-                let detail = lastFetchedDetailById[pair.bangumiBook.id];
-                if (!detail) {
-                    try {
-                        detail = await fetchSubjectDetail(pair.bangumiBook.id);
-                        if (detail) lastFetchedDetailById[pair.bangumiBook.id] = detail;
-                    } catch (e) {
-                        console.warn('[KomgaScraper] [Auto] Failed to fetch subject detail for', pair.bangumiBook.id, e);
-                        detail = null;
-                    }
-                }
-
-                if (!detail) {
-                    failedCount++;
-                    continue;
-                }
-
-                const ok = await writeAutoScrapedBookMetadata(pair.komgaBook.id, detail, pair.komgaBook);
-                if (ok) successCount++;
-                else failedCount++;
-            }
-
-            // 汇总展示
-            showAutoScrapeResultSummary(successCount, skippedCount, failedCount, total);
+            // 弹出确认框，用户确认后再开始逐本刮削
+            showAutoScrapeConfirm(seriesTitle, total, matchedCount, function() {
+                runAutoScrapeLoop(pairs, total);
+            });
 
         } catch (e) {
             console.error('[KomgaScraper] [Auto] Auto scrape failed:', e);
             showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
+        }
+
+        async function runAutoScrapeLoop(pairs, total) {
+            try {
+                let successCount = 0;
+                let skippedCount = 0;
+                let failedCount = 0;
+                const lastFetchedDetailById = {};
+                const maxRetries = 2;
+
+                for (let i = 0; i < total; i++) {
+                    const pair = pairs[i];
+                    if (!pair.bangumiBook) {
+                        skippedCount++;
+                        updateLoadingProgress(i + 1, total, '自动刮削中');
+                        continue;
+                    }
+
+                    updateLoadingProgress(i + 1, total, '正在处理第 ' + String(i + 1) + ' 本');
+
+                    let detail = lastFetchedDetailById[pair.bangumiBook.id];
+                    if (!detail) {
+                        // 最多重试 maxRetries 次，每次之间加一个小延迟
+                        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+                            try {
+                                detail = await fetchSubjectDetail(pair.bangumiBook.id);
+                                if (detail) {
+                                    lastFetchedDetailById[pair.bangumiBook.id] = detail;
+                                    break;
+                                }
+                            } catch (e) {
+                                console.warn('[KomgaScraper] [Auto] Fetch subject detail failed (attempt ' + (attempt + 1) + '/' + (maxRetries + 1) + '):', pair.bangumiBook.id, e);
+                            }
+                            if (attempt < maxRetries) {
+                                await new Promise(function(res) { setTimeout(res, 1500); });
+                            }
+                        }
+                    }
+
+                    if (!detail) {
+                        failedCount++;
+                        continue;
+                    }
+
+                    const ok = await writeAutoScrapedBookMetadata(pair.komgaBook.id, detail, pair.komgaBook);
+                    if (ok) successCount++;
+                    else failedCount++;
+                }
+
+                // 汇总展示
+                showAutoScrapeResultSummary(successCount, skippedCount, failedCount, total);
+            } catch (e) {
+                console.error('[KomgaScraper] [Auto] Auto scrape loop failed:', e);
+                showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
+            }
         }
     }
 
@@ -2700,6 +2737,7 @@
 
     function init() {
         checkConfigVersion();
+        injectCommonStyles();
         registerShortcuts();
 
         if (typeof GM_registerMenuCommand === 'function') {
