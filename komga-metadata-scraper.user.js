@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.3
+// @version      1.2.4
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -10,11 +10,10 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
-// —— 脚本实际对外请求的域名（给 AI Agent 看：新增数据源时请在此添加对应 @connect）——
-// @connect      bgm.tv         # Bangumi 条目/详情 API
-// @connect      *.bgm.tv         # Bangumi 条目/详情 API
-// @connect      dmm.co.jp      # DMM / Fanza 搜索、详情页与站内图片
-// @connect      *.dmm.co.jp      # DMM / Fanza 搜索、详情页与站内图片
+// @connect      *
+// @connect      api.bgm.tv
+// @connect      www.dmm.co.jp
+// @connect      doujin-assets.dmm.co.jp
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js
 // @run-at       document-end
 // @sandbox      JavaScript
