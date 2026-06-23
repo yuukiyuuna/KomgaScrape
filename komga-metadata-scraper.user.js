@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.0
+// @version      1.2.2
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -36,7 +36,7 @@
     // ============================================================
 
     const CONFIG_KEY = 'komga_scraper_config';
-    const SCRIPT_VERSION = '1.2.0';
+    const SCRIPT_VERSION = '1.2.2';
 
     const defaultConfig = {
         version: SCRIPT_VERSION,
@@ -677,7 +677,7 @@
     // ============================================================
 
     const BANGUMI_API_BASE = 'https://api.bgm.tv';
-    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/1.2.0 (https://github.com/yourname/komga-scraper)';
+    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/1.2.2 (https://github.com/yourname/komga-scraper)';
 
     async function scrapeFromBangumi(keyword) {
         try {
