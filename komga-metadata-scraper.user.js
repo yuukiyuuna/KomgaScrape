@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.4
+// @version      1.2.5
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -663,6 +663,59 @@
         return result;
     }
 
+    // 从 infobox 中提取「册数」（系列总卷数），解析为正整数
+    // 匹配逻辑：
+    //   - 直接匹配 key 等于或包含「册数」的条目（如 {"key": "册数", "value": "8"}）
+    //   - value 可能是字符串 "8"、"8卷"、"3卷既刊"，只取首次出现的正整数
+    //   - value 也可能是对象数组（如 [{k: "册数", v: "3卷既刊"}]），同样取里面的 k/v
+    // 如果找不到有效的正整数，返回 null（避免误写入未完结的系列）
+    function extractTotalBookCountFromInfobox(infobox) {
+        if (!infobox || !Array.isArray(infobox)) return null;
+
+        const parsePositiveInt = function(s) {
+            if (!s) return null;
+            const m = String(s).match(/\d+/);
+            if (!m) return null;
+            const n = parseInt(m[0], 10);
+            return n > 0 ? n : null;
+        };
+
+        for (let i = 0; i < infobox.length; i++) {
+            const item = infobox[i];
+            const key = String(item.key || '');
+            if (key.indexOf('册数') === -1 && key.indexOf('册') === -1) continue;
+
+            // 跳过版本区分（"版本:xxx" 中的册数是该版本独立的册数，通常不是原版总卷数）
+            // 由于顶层 infobox 的 key 本身就是「册数」，所以这里直接取即可
+
+            let value = item.value;
+            if (typeof value === 'string') {
+                const n = parsePositiveInt(value);
+                if (n) return n;
+            } else if (Array.isArray(value)) {
+                // 数组形式，遍历其中的 {k, v} 对象
+                for (let vi = 0; vi < value.length; vi++) {
+                    const sub = value[vi];
+                    if (!sub) continue;
+                    if (typeof sub === 'string') {
+                        const n = parsePositiveInt(sub);
+                        if (n) return n;
+                    } else if (sub && typeof sub === 'object') {
+                        const subK = String(sub.k || '');
+                        if (subK.indexOf('册数') !== -1 || subK.indexOf('册') !== -1) {
+                            const n = parsePositiveInt(sub.v);
+                            if (n) return n;
+                        }
+                    }
+                }
+            } else if (value && typeof value === 'object' && 'v' in value) {
+                const n = parsePositiveInt(value.v);
+                if (n) return n;
+            }
+        }
+        return null;
+    }
+
     function mapBangumiToSeries(bangumiData, currentMetadata) {
         const metadata = currentMetadata || {};
         const newMetadata = {};
@@ -677,8 +730,27 @@
         const infoboxStatus = extractStatusFromInfobox(bangumiData.infobox);
         newMetadata.status = infoboxStatus || mapBangumiStatus(bangumiData.status) || metadata.status;
 
+        // 如果 infobox 中存在「册数」，写入 Komga 的 totalBookCount 字段
+        // 未完结的作品通常没有此字段，函数会返回 null，此时不写入
+        const totalBookCount = extractTotalBookCountFromInfobox(bangumiData.infobox);
+        if (totalBookCount) {
+            newMetadata.totalBookCount = totalBookCount;
+        }
+
         if (bangumiData.links && bangumiData.links.length > 0) {
             newMetadata.links = bangumiData.links;
+        }
+
+        // 只有当系列名有两个或两个以上时才写入 alternateTitles（别名）字段
+        // 格式：[{label: "中文", title: "..."}, {label: "日文", title: "..."}]
+        // 只有一个或一个都没有时，不写入 Komga
+        const titleZh = (bangumiData.nameCn || '').trim();
+        const titleJp = (bangumiData.name || '').trim();
+        const altTitles = [];
+        if (titleZh) altTitles.push({ label: '中文', title: titleZh });
+        if (titleJp) altTitles.push({ label: '日文', title: titleJp });
+        if (altTitles.length >= 2) {
+            newMetadata.alternateTitles = altTitles;
         }
 
         return newMetadata;
@@ -786,10 +858,14 @@
                 const airDateVal = item.date || item.air_date || '';
                 const itemId = String(item.id || '').replace(/[^0-9a-zA-Z]/g, '');
                 const bangumiUrl = cleanUrl('https://bgm.tv/subject/' + itemId);
+                const rawName = String(item.name || '').trim();
+                const rawNameCn = String(item.name_cn || '').trim();
                 const result = {
                     id: itemId,
-                    title: item.name_cn || item.name,
-                    originalTitle: item.name,
+                    title: rawNameCn || rawName,
+                    originalTitle: rawName,
+                    name: rawName,
+                    nameCn: rawNameCn,
                     summary: item.summary || '',
                     image: item.images && item.images.common ? item.images.common : '',
                     largeImage: item.images && item.images.large ? item.images.large : '',
@@ -879,10 +955,14 @@
             const subjectItemId = String(data.id || '').replace(/[^0-9a-zA-Z]/g, '');
             const subjectDate = data.date || data.air_date || '';
             const bangumiLinkUrl = cleanUrl('https://bgm.tv/subject/' + subjectItemId);
+            const rawDetailName = String(data.name || '').trim();
+            const rawDetailNameCn = String(data.name_cn || '').trim();
             const detail = {
                 id: subjectItemId,
-                title: data.name_cn || data.name,
-                originalTitle: data.name,
+                title: rawDetailNameCn || rawDetailName,
+                originalTitle: rawDetailName,
+                name: rawDetailName,
+                nameCn: rawDetailNameCn,
                 summary: data.summary || '',
                 image: data.images && data.images.common ? data.images.common : '',
                 largeImage: data.images && data.images.large ? data.images.large : '',
@@ -1823,6 +1903,9 @@
         if (pageType === 'series') {
             fields.push({ key: 'titleSort', label: '排序标题', type: 'text', value: currentMetadata.titleSort || mappedMetadata.titleSort || mappedMetadata.title || '', checked: !isFieldLocked('titleSort'), locked: isFieldLocked('titleSort') });
             fields.push({ key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') });
+            if (mappedMetadata.totalBookCount) {
+                fields.push({ key: 'totalBookCount', label: '书籍总数', type: 'text', value: String(mappedMetadata.totalBookCount), checked: !isFieldLocked('totalBookCount'), locked: isFieldLocked('totalBookCount') });
+            }
         }
 
         if (pageType === 'book') {
@@ -1933,6 +2016,29 @@
         }
 
         if (pageType === 'series') {
+            // alternateTitles：显示和编辑中文/日文别名，格式每行 "label|title"
+            const altTitlesRaw = Array.isArray(mappedMetadata.alternateTitles) && mappedMetadata.alternateTitles.length > 0
+                ? mappedMetadata.alternateTitles
+                : null;
+            if (altTitlesRaw) {
+                const altTitlesLocked = currentMetadata.alternateTitlesLock === true;
+                const altText = altTitlesRaw.map(function(at) {
+                    const lbl = String(at.label || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+                    const ttl = String(at.title || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+                    return lbl + '|' + ttl;
+                }).join('\n');
+                previewHtml += `
+                    <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
+                        <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
+                            <input type="checkbox" class="ks-alt-titles-checkbox" ${altTitlesLocked ? 'disabled' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                            <span style="color:#fff;font-size:14px;font-weight:500;">别名 (Alternate Titles)${altTitlesLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
+                        </label>
+                        <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">每行一个别名，格式: <code style="color:#ffc107;">label|title</code>（例: <code style="color:#ffc107;">中文|我的作品</code>）</div>
+                        <textarea class="ks-alt-titles-input" ${altTitlesLocked ? 'disabled' : ''} style="width:calc(100% - 16px);min-height:60px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${altText}</textarea>
+                    </div>
+                `;
+            }
+
             const rdLocked = currentMetadata.readingDirectionLock === true;
             const currentRd = (currentMetadata.readingDirection || '').toUpperCase();
             const defaultRd = 'RIGHT_TO_LEFT';
@@ -1983,7 +2089,7 @@
             const selectedFields = {};
             const updatedFields = [];
             const skippedFields = [];
-            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -2051,6 +2157,31 @@
                     if (rdValue) {
                         selectedFields.readingDirection = rdValue;
                         updatedFields.push('阅读方向');
+                    }
+                }
+
+                // alternateTitles：解析多行 "label|title" 格式为对象数组
+                const altCb = modal.querySelector('.ks-alt-titles-checkbox');
+                const altInput = modal.querySelector('.ks-alt-titles-input');
+                if (altCb && altCb.checked && altInput) {
+                    const rawAlt = String(altInput.value || '').trim();
+                    if (rawAlt) {
+                        const altLines = rawAlt.split('\n').map(function(l) { return l.trim(); }).filter(function(l) { return l && l.length > 0; });
+                        const altArr = [];
+                        for (let ali = 0; ali < altLines.length; ali++) {
+                            const line = altLines[ali];
+                            const pipeIdx = line.indexOf('|');
+                            if (pipeIdx === -1) continue;
+                            const labelPart = line.substring(0, pipeIdx).trim();
+                            const titlePart = line.substring(pipeIdx + 1).trim();
+                            if (labelPart && titlePart) {
+                                altArr.push({ label: labelPart, title: titlePart });
+                            }
+                        }
+                        if (altArr.length > 0) {
+                            selectedFields.alternateTitles = altArr;
+                            updatedFields.push('别名');
+                        }
                     }
                 }
             }
@@ -2292,7 +2423,7 @@
             const finalMetadata = {};
             const finalUpdated = [];
             const writtenScalarKeys = [];
-            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数' };
 
             if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
@@ -2312,6 +2443,28 @@
                     if (merged.length > 0) {
                         finalMetadata.links = merged;
                         finalUpdated.push(fieldLabels.links || 'links');
+                    }
+                    return;
+                }
+
+                if (key === 'alternateTitles') {
+                    // 预期格式：[{label: "中文", title: "xxx"}, {label: "日文", title: "yyy"}]
+                    if (Array.isArray(value) && value.length > 0) {
+                        const validTitles = value.filter(function(at) {
+                            if (!at || !at.title) return false;
+                            const lbl = String(at.label || '').trim();
+                            const ttl = String(at.title || '').trim();
+                            return lbl.length > 0 && ttl.length > 0 && ttl.length <= 300;
+                        }).map(function(at) {
+                            return { label: String(at.label || '').trim(), title: String(at.title || '').trim() };
+                        });
+                        if (validTitles.length > 0) {
+                            finalMetadata.alternateTitles = validTitles;
+                            finalUpdated.push('别名');
+                            writtenScalarKeys.push('alternateTitles');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid alternateTitles value:', value);
+                        }
                     }
                     return;
                 }
@@ -2393,6 +2546,20 @@
                             writtenScalarKeys.push('readingDirection');
                         } else if (config.debug) {
                             console.log('[KomgaScraper] Skipping invalid readingDirection value:', value);
+                        }
+                    }
+                    return;
+                }
+
+                if (key === 'totalBookCount') {
+                    if (value !== null && value !== undefined && value !== '') {
+                        const num = Number(value);
+                        if (Number.isInteger(num) && num > 0) {
+                            finalMetadata.totalBookCount = num;
+                            finalUpdated.push('书籍总数');
+                            writtenScalarKeys.push('totalBookCount');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid totalBookCount value:', value);
                         }
                     }
                     return;
