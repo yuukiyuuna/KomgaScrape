@@ -2,7 +2,7 @@
 
 一个用于 [Komga](https://komga.org/) 的用户脚本（Userscript），可以从外部数据源抓取漫画 / 书籍的元数据，并写回 Komga。
 
-当前版本：**v1.2.3**
+当前版本：**v1.2.6**
 
 ## 功能概览
 
@@ -42,7 +42,7 @@
 
 **步骤：**
 1. 进入系列详情页，点击 "自动刮削" 按钮。
-2. 脚本先读取该系列下的全部书籍，再从 `GET https://api.bgm.tv/v0/subjects/{seriesSubjectId}/subjects` 读取系列中的分卷 / 章节条目。
+2. 脚本先读取该系列下的全部书籍，再从 `GET https://api.bgm.tv/v0/subjects/{seriesSubjectId}/subjects` 读取系列中的分卷 / 章节条目；只取其中 `type=1`（书籍）的条目，并让 `relation=单行本` 的条目优先参与卷号匹配（避免广播剧、动画、相同世界观等条目抢占卷号）。
 3. 弹出**确认对话框**，显示系列名、书籍总数、匹配数、跳过数。点击 "开始" 进入批处理。
 4. 逐本进行：按 Komga 书籍的 `number`（卷号）与 Bangumi 条目中解析出的卷号匹配；匹配成功后调用 `GET https://api.bgm.tv/v0/subjects/{id}` 拉取详细元数据，**直接写入并加锁**（不再要求手动确认）。
 5. 每本书的详情拉取失败会自动**最多重试 2 次**（间隔 1.5 秒）。
@@ -51,6 +51,16 @@
 **匹配规则：** 优先匹配 Bangumi 标题中明确标识的 "第 N 卷" / "Vol.N" / "Volume N"；未找到时再取标题里出现的首个整数（1–999 之间，排除像年份这样的误匹配）。Komga 的 `number` 必须**完全相等**才会被写入。不匹配的书籍会报告为"跳过"，不会被动写入。
 
 **字段加锁策略：** 自动刮削写入的所有字段（title、summary、releaseDate、isbn、authors、links、number、numberSort 等）会被自动附加 `*Lock=true`，避免被 Komga 内置扫描覆盖。
+
+### 2.1 Bangumi 接口降级（v1.2.6 起）
+
+Bangumi 的 v0 接口（`api.bgm.tv/v0/...`）偶尔会整段不可用（例如未缓存请求一律返回 `502`，只有 Cloudflare 缓存里的旧数据还能读到）。脚本按下面的顺序自动降级，尽量不影响刮削：
+
+- **搜索：** `POST /v0/search/subjects` → 失败或无结果时改用旧版接口 `GET /search/subject/{keyword}?type=1&responseGroup=small&max_results=10`。搜索参数严格按官方文档构造：`sort=match`、`filter.type=[1]`，且**不传** `filter.nsfw`（文档中 `true` 表示“只返回 R18”，传了会把普通条目全部过滤掉，这是“明明有却搜不到”的常见原因）。
+- **详情：** `GET /v0/subjects/{id}` → 失败时解析网页 `https://bgm.tv/subject/{id}` 的 infobox（ISBN / 发售日期 / 页数 / 作者 / 别名等字段与 v0 一致）→ 再失败时退回旧版 JSON `GET /subject/{id}?responseGroup=large`。
+- **系列子条目：** `GET /v0/subjects/{id}/subjects` → 失败时解析网页 `https://bgm.tv/subject/{id}/offprints` 的单行本列表。
+- v0 连续失败后会在 **5 分钟**内跳过 v0 直接走降级（避免自动刮削时每本书都白等一次超时）；v0 恢复后自动重新优先使用。
+- 如果两条链路都失败，脚本会明确提示"Bangumi 搜索接口不可用 / Bangumi 接口不可用"（并带 HTTP 状态），不再误报成"未找到匹配结果"。
 
 ### 3. 快捷键
 
@@ -76,7 +86,7 @@
 | `isbn` | ISBN（若可解析，统一转换为 ISBN-13） | 是 |
 | `authors` | 作者 / 作画（以 name + role 列表写入） | 是 |
 | `tags` | 标签（与现有 tag 合并去重） | 否 |
-| `links` | 来源链接（`Bangumi` 或 `Fanza`） | 否 |
+| `links` | 来源链接（`bangumi` 或 `Fanza`） | 否 |
 | `readingDirection` | 阅读方向（系列级可选） | 是 |
 | `number` | 卷号（仅自动刮削时保持 Komga 值并加锁） | 是 |
 | `numberSort` | 排序用卷号（同上） | 是 |
@@ -88,7 +98,7 @@
 - **浏览器：** 现代浏览器（Chrome / Edge / Firefox / Safari 最新一两个版本）。
 - **Userscript 管理器：** 必须支持 `GM_xmlhttpRequest` / `GM_setValue` / `GM_getValue` / `GM_registerMenuCommand`。
 - **Komga 版本：** 任何暴露 `/api/v1/series/{id}`、`/api/v1/books/{id}`、以及对应 `PATCH /metadata` 接口的版本。
-- **Bangumi API：** 使用官方 `https://api.bgm.tv/v0/...`，无需鉴权（公开数据）；脚本在请求头中使用 `User-Agent: KomgaMetadataScraper/1.2.0` 标注自身。
+- **Bangumi API：** 使用官方 `https://api.bgm.tv/v0/...`，无需鉴权（公开数据）；脚本在请求头中使用 `User-Agent: KomgaMetadataScraper/{版本号}` 标注自身。
 
 ## 注意事项
 
@@ -97,4 +107,36 @@
 - 自动刮削的默认节流为 **2 秒 / 请求**，可以在设置面板中调节 `rateLimit.minInterval`；若需要更激进的抓取，请自行承担被远端限流的风险。
 - **Fanza / DMM 页面可能会随时变更 DOM 结构**，一旦解析失败请在本仓库提出 Issue；Fanza 不支持自动刮削。
 
+## 更新日志
+
+### v1.2.6
+
+- **来源链接标签改为小写 `bangumi`**：写入 Komga 时的新链接统一使用 `bangumi`；已存在 `Bangumi` / 空标签的 `bgm.tv/subject/{id}` 链接在下次写入时自动归一化，Fanza 链接与 URL 去重规则不变。
+- **搜索接口对齐官方文档**（`https://bangumi.github.io/api/dist.json`）：`sort` 由 `rank` 改为默认的 `match`；**不再传 `filter.nsfw`**（文档中 `true` 表示“只返回 R18”，会让普通条目搜不到，这正是“明明有却提示未找到匹配结果”的常见原因）；UA 中的仓库地址不再是占位符。
+- **新增 Bangumi 接口降级**（详见 [2.1 Bangumi 接口降级](#21-bangumi-接口降级v126-起)）：
+  - 搜索：v0 → 旧版 `/search/subject/{keyword}`；
+  - 详情：v0 → `https://bgm.tv/subject/{id}` 网页 infobox → 旧版 `/subject/{id}?responseGroup=large`；
+  - 系列子条目：v0 → 网页 `/subject/{id}/offprints`。
+- **系列子条目按文档过滤**：只保留 `type=1`（书籍）的关系条目，并让 `relation=单行本` 优先参与卷号匹配，避免「广播剧 / 动画 / 相同世界观」条目抢占卷号。
+- **失败提示不再误导**：v0 连续失败后 5 分钟内跳过 v0 直接走降级；两条链路都失败时明确提示“Bangumi 搜索接口不可用 / Bangumi 接口不可用”并带上 HTTP 状态，不再显示“未找到匹配结果”；降级成功时在结果弹窗中给出提示。
+
+### v1.2.5
+
+- 系列刮削支持 `totalBookCount` / `alternateTitles`：册数写入书籍总数，中日双名写入别名（≥2 个名称时才写入）。
+
+### v1.2.4
+
+- 版本号更新，恢复 `doujin-assets.dmm.co.jp` 的 `@connect` 声明。
+
+### v1.2.3
+
+- 精简 `@connect` 声明，统一版本号来源，优化元数据块可读性。
+
+### v1.2.2
+
+- 抽取公共 CSS、改进进度显示、自动刮削增加确认与重试、规范卷号匹配。
+
+### v1.2.0
+
+- 新增自动刮削（Bangumi 系列级按卷号匹配），补充 README 与 .gitignore；Fanza / DMM 不支持自动刮削。
 

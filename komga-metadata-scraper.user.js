@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.5
+// @version      1.2.6
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -492,6 +492,15 @@
         return s.trim();
     }
 
+    // Bangumi 相关图片可能是 http:// 或 // 开头（Komga 一般是 https 页面），统一成 https
+    function toHttpsUrl(url) {
+        const s = String(url == null ? '' : url).trim();
+        if (!s) return '';
+        if (s.indexOf('//') === 0) return 'https:' + s;
+        if (/^http:\/\//i.test(s)) return 'https://' + s.substring('http://'.length);
+        return s;
+    }
+
     function convertIsbn10ToIsbn13(isbn10) {
         if (!isbn10 || isbn10.length !== 10) return '';
         const prefix = '978' + isbn10.substring(0, 9);
@@ -540,6 +549,11 @@
         return result;
     }
 
+    // Bangumi 来源链接统一使用的小写标签（写回 Komga 的 metadata.links[].label）
+    const BANGUMI_LINK_LABEL = 'bangumi';
+    // 命中该模式的链接（bgm.tv/subject/{id}，含 www./api. 子域）标签一律归一化
+    const BANGUMI_SUBJECT_URL_PATTERN = /bgm\.tv\/subject\//i;
+
     function mergeLinks(newLinks, currentLinks) {
         const byUrl = {};
         const result = [];
@@ -547,7 +561,11 @@
             if (!link) return;
             const url = cleanUrl(link.url);
             if (!url) return;
-            const label = String(link.label || '').trim();
+            let label = String(link.label || '').trim();
+            // 历史数据里可能是 'Bangumi' 或空标签，这里统一成 'bangumi'，避免新旧写法并存
+            if (BANGUMI_SUBJECT_URL_PATTERN.test(url)) {
+                label = BANGUMI_LINK_LABEL;
+            }
             if (!byUrl[url]) {
                 const entry = { label: label, url: url };
                 byUrl[url] = entry;
@@ -789,248 +807,718 @@
     // ============================================================
 
     // Bangumi API 文档： https://bangumi.github.io/api/
+    // OpenAPI spec（可直接下载核对参数）： https://bangumi.github.io/api/dist.json
     // 常用接口（便于 agent 直接调用测试）：
     //   - 搜索条目：   POST https://api.bgm.tv/v0/search/subjects?limit=10
-    //                  body: {"keyword":"xxx","sort":"rank"}
-    //   - 系列章节：   GET  https://api.bgm.tv/v0/subjects/{subjectId}/subjects
+    //                  body: {"keyword":"xxx","sort":"match","filter":{"type":[1]}}
+    //                  文档要点：sort 默认 'match'（另有 heat/rank/score），按匹配度排序最相关；
+    //                  filter.nsfw 是 boolean：true=只返回 R18、false=只返回非 R18、缺省/null=返回全部，
+    //                  因此脚本不传该字段 —— 传 true 会把普通条目过滤掉，是“搜不到结果”的常见原因；
+    //                  filter.type: 1=书籍 2=动画 3=音乐 4=游戏 6=三次元。
+    //   - 系列关系：   GET  https://api.bgm.tv/v0/subjects/{subjectId}/subjects
+    //                  返回 SubjectRelation[]（id/type/name/name_cn/relation），
+    //                  脚本只保留 type===1 的书籍条目，并让 relation==='单行本' 的排在前面。
     //   - 章节详情：   GET  https://api.bgm.tv/v0/subjects/{subjectId}
+    // 降级链（v0 接口不可用时启用；实测 v0 未缓存请求可能返回 502，而以下接口正常）：
+    //   - 搜索：  GET https://api.bgm.tv/search/subject/{keyword}?type=1&responseGroup=small&max_results=10
+    //   - 详情：  GET https://bgm.tv/subject/{id} （HTML，infobox 最全）
+    //             GET https://api.bgm.tv/subject/{id}?responseGroup=large （旧版 JSON，无 infobox）
+    //   - 系列：  GET https://bgm.tv/subject/{id}/offprints （HTML 单行本列表）
     const BANGUMI_API_BASE = 'https://api.bgm.tv';
+    // 旧版接口与 v0 同域，但属于不同代 API，可用性互相独立
+    const BANGUMI_LEGACY_API_BASE = 'https://api.bgm.tv';
+    // 网页兜底（HTML 解析）
+    const BANGUMI_WEB_BASE = 'https://bgm.tv';
     // 【给 AI Agent 看】UA 中版本号必须从 SCRIPT_VERSION 读取；
     // 不要在此处写死 '1.x.x' 之类的具体版本号。
-    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/' + SCRIPT_VERSION + ' (https://github.com/yourname/komga-scraper)';
+    const BANGUMI_USER_AGENT = 'KomgaMetadataScraper/' + SCRIPT_VERSION + ' (https://github.com/chenglin-han/KomgaScrape)';
 
+    // ---------------- 7.1 Bangumi 通用工具 ----------------
+
+    // v0 接口短期熔断：任一 v0 请求返回 status 0（网络错误/被拦截）或 >= 500 时，
+    // 在该 TTL 内直接走降级链，避免自动刮削时每本书都先白等一次失败请求。
+    const BANGUMI_V0_DOWN_TTL_MS = 5 * 60 * 1000;
+    const BANGUMI_V0_SKIPPED = 'skipped';
+    let bangumiV0DownUntil = 0;
+    // 搜索走了旧版接口时置为提示文案，由 showSearchResults 展示
+    let lastBangumiSearchNotice = '';
+
+    function isBangumiV0Down() {
+        return Date.now() < bangumiV0DownUntil;
+    }
+
+    function markBangumiV0Down(status) {
+        if (status === 0 || status >= 500) {
+            bangumiV0DownUntil = Date.now() + BANGUMI_V0_DOWN_TTL_MS;
+        }
+    }
+
+    function describeBangumiFailure(status) {
+        if (status === BANGUMI_V0_SKIPPED) return '此前请求失败，5 分钟内暂不重试';
+        if (status === 0 || status == null) return '网络错误或请求超时';
+        return 'HTTP ' + status;
+    }
+
+    // 把失败/异常统一收敛成 { ok, status, ... }，便于降级链判断
+    async function safeBangumiRequest(fn) {
+        try {
+            return await fn();
+        } catch (e) {
+            console.warn('[KomgaScraper] [Bangumi] request threw:', e && e.message ? e.message : e);
+            return { ok: false, status: 0 };
+        }
+    }
+
+    // 统一构造搜索结果对象（v0 与旧版接口共用，保证 UI 与后续流程一致）
+    function createBangumiSearchResult(raw) {
+        const itemId = String(raw.id || '').replace(/[^0-9a-zA-Z]/g, '');
+        const name = String(raw.name || '').trim();
+        const nameCn = String(raw.nameCn || '').trim();
+        const airDate = String(raw.airDate || '').trim();
+        const bangumiUrl = cleanUrl(BANGUMI_WEB_BASE + '/subject/' + itemId);
+        return {
+            id: itemId,
+            title: nameCn || name,
+            originalTitle: name,
+            name: name,
+            nameCn: nameCn,
+            summary: raw.summary || '',
+            image: toHttpsUrl(raw.image),
+            largeImage: toHttpsUrl(raw.largeImage),
+            rating: raw.rating != null && raw.rating !== '' ? raw.rating : null,
+            status: airDate && airDate > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
+            airDate: airDate,
+            url: bangumiUrl,
+            date: String(raw.date || airDate || ''),
+            links: [{ label: BANGUMI_LINK_LABEL, url: bangumiUrl }]
+        };
+    }
+
+    /**
+     * v0 搜索（POST /v0/search/subjects），严格按官方文档构造请求体：
+     *   - sort 默认 'match'（另有 heat/rank/score），按匹配度排序，最相关的条目排在最前
+     *   - filter.type: [1] 表示只搜索「书籍」条目
+     *   - 不传 filter.nsfw：文档中 true=只返回 R18、false=只返回非 R18，
+     *     缺省/null 才是“返回全部”；传 true 会把普通条目全部过滤掉
+     * 返回 { ok, status, results }
+     */
+    async function searchBangumiViaV0(keyword) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const searchUrl = BANGUMI_API_BASE + '/v0/search/subjects?limit=10';
+        const requestBody = JSON.stringify({
+            keyword: keyword,
+            sort: 'match',
+            filter: {
+                type: [1]
+            }
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 search URL:', searchUrl);
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 search body:', requestBody);
+
+        const response = await fetchWithRateLimit({
+            method: 'POST',
+            url: searchUrl,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            },
+            data: requestBody
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 search status:', response.status, 'hasData:', !!response.data);
+
+        if (response.status !== 200 || !response.data || !Array.isArray(response.data.data)) {
+            markBangumiV0Down(response.status);
+            console.warn('[KomgaScraper] [Bangumi] v0 search unavailable, status:', response.status,
+                response.raw ? String(response.raw).replace(/\s+/g, ' ').substring(0, 120) : '');
+            return { ok: false, status: response.status, results: [] };
+        }
+
+        const results = response.data.data.map(function(item) {
+            return createBangumiSearchResult({
+                id: item.id,
+                name: item.name,
+                nameCn: item.name_cn,
+                summary: item.summary,
+                image: item.images && item.images.common,
+                largeImage: item.images && item.images.large,
+                rating: item.rating && item.rating.score,
+                date: item.date || '',
+                airDate: item.date || item.air_date || ''
+            });
+        });
+
+        if (debug) {
+            results.forEach(function(r, index) {
+                console.log('[KomgaScraper] [Bangumi] v0 result ' + (index + 1) + ':', r.title, r.originalTitle);
+            });
+            console.log('[KomgaScraper] [Bangumi] v0 total', results.length, 'results found');
+        }
+        return { ok: true, status: 200, results: results };
+    }
+
+    /**
+     * 旧版搜索（GET /search/subject/{keyword}?type=1&responseGroup=small&max_results=10）
+     * 用于 v0 接口不可用/无结果时降级；返回结构较简单（无 infobox、无评分）。
+     * 返回 { ok, status, results }
+     */
+    async function searchBangumiViaLegacy(keyword) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const url = BANGUMI_LEGACY_API_BASE + '/search/subject/' + encodeURIComponent(keyword) +
+            '?type=1&responseGroup=small&max_results=10';
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] legacy search URL:', url);
+
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: url,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            }
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] legacy search status:', response.status, 'hasData:', !!response.data);
+
+        if (response.status !== 200 || !response.data || !Array.isArray(response.data.list)) {
+            console.warn('[KomgaScraper] [Bangumi] legacy search failed, status:', response.status);
+            return { ok: false, status: response.status, results: [] };
+        }
+
+        const results = response.data.list.map(function(item) {
+            return createBangumiSearchResult({
+                id: item.id,
+                name: item.name,
+                nameCn: item.name_cn,
+                summary: item.summary,
+                image: item.images && (item.images.common || item.images.medium),
+                largeImage: item.images && item.images.large,
+                rating: null,
+                date: item.air_date || '',
+                airDate: item.air_date || ''
+            });
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] legacy total', results.length, 'results found');
+        return { ok: true, status: 200, results: results };
+    }
+
+    /**
+     * Bangumi 搜索入口：v0 优先，失败或无结果时降级到旧版接口。
+     * 两条链路都失败时抛出带 bangumiApiError 标记的错误，
+     * 让 UI 能区分“接口不可用”和“真的没有结果”。
+     */
     async function scrapeFromBangumi(keyword) {
-        try {
-            const config = getConfig();
-            const debug = config.debug;
+        const config = getConfig();
+        const debug = config.debug;
 
-            if (debug) console.log('[KomgaScraper] [Bangumi] Searching v0 for keyword:', keyword);
+        lastBangumiSearchNotice = '';
 
-            const searchUrl = BANGUMI_API_BASE + '/v0/search/subjects?limit=10';
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Request URL:', searchUrl);
-
-            const requestBody = JSON.stringify({
-                keyword: keyword,
-                sort: 'rank',
-                filter: {
-                    type: [1],
-                    nsfw: true
-                }
-            });
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Request body:', requestBody);
-
-            const response = await fetchWithRateLimit({
-                method: 'POST',
-                url: searchUrl,
-                headers: {
-                    'User-Agent': BANGUMI_USER_AGENT,
-                    'Accept': 'application/json',
-                    'Content-Type': 'application/json',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                },
-                data: requestBody
-            });
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Response status:', response.status, 'hasData:', !!response.data);
-
-            if (response.status !== 200) {
-                console.warn('[KomgaScraper] [Bangumi] Non-200 status code:', response.status);
-                if (response.status === 0) {
-                    console.warn('[KomgaScraper] [Bangumi] Status 0 detected - request was blocked by CORS');
-                    throw new Error('请求被阻止，请检查网络或浏览器权限');
-                }
-                return [];
+        let v0Failure = null;
+        let v0Failed = false;
+        if (isBangumiV0Down()) {
+            v0Failure = BANGUMI_V0_SKIPPED;
+            v0Failed = true;
+            if (debug) console.log('[KomgaScraper] [Bangumi] v0 marked unavailable, skipping to legacy API');
+        } else {
+            const v0 = await safeBangumiRequest(function() { return searchBangumiViaV0(keyword); });
+            if (v0.ok && v0.results.length > 0) {
+                return v0.results;
             }
-
-            if (!response.data) {
-                if (debug) console.log('[KomgaScraper] [Bangumi] Response data is null, raw response:', response.raw ? response.raw.substring(0, 200) : 'empty');
-                return [];
+            if (v0.ok) {
+                if (debug) console.log('[KomgaScraper] [Bangumi] v0 returned no results, trying legacy API');
+            } else {
+                v0Failure = v0.status;
+                v0Failed = true;
             }
-
-            if (!response.data.data || response.data.data.length === 0) {
-                if (debug) console.log('[KomgaScraper] [Bangumi] No results in response');
-                return [];
-            }
-
-            const results = response.data.data.map(function(item, index) {
-                const airDateVal = item.date || item.air_date || '';
-                const itemId = String(item.id || '').replace(/[^0-9a-zA-Z]/g, '');
-                const bangumiUrl = cleanUrl('https://bgm.tv/subject/' + itemId);
-                const rawName = String(item.name || '').trim();
-                const rawNameCn = String(item.name_cn || '').trim();
-                const result = {
-                    id: itemId,
-                    title: rawNameCn || rawName,
-                    originalTitle: rawName,
-                    name: rawName,
-                    nameCn: rawNameCn,
-                    summary: item.summary || '',
-                    image: item.images && item.images.common ? item.images.common : '',
-                    largeImage: item.images && item.images.large ? item.images.large : '',
-                    rating: item.rating && item.rating.score ? item.rating.score : null,
-                    status: airDateVal && airDateVal > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
-                    airDate: airDateVal,
-                    url: bangumiUrl,
-                    date: item.date || '',
-                    links: [{ label: 'Bangumi', url: bangumiUrl }]
-                };
-
-                if (debug) console.log('[KomgaScraper] [Bangumi] Result ' + (index + 1) + ':', result.title, result.originalTitle);
-                return result;
-            });
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Total', results.length, 'results found');
-            return results;
-
-        } catch (e) {
-            console.error('[KomgaScraper] [Bangumi] Search failed with error:', e);
-            throw e;
         }
-    }
 
-    async function fetchSubjectDetail(subjectIdParam) {
-        try {
-            const config = getConfig();
-            const debug = config.debug;
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Fetching detail for subject:', subjectIdParam);
-
-            const detailUrl = BANGUMI_API_BASE + '/v0/subjects/' + subjectIdParam;
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Detail URL:', detailUrl);
-
-            const response = await fetchWithRateLimit({
-                method: 'GET',
-                url: detailUrl,
-                headers: {
-                    'User-Agent': BANGUMI_USER_AGENT,
-                    'Accept': 'application/json',
-                    'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
-                }
-            });
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Detail response status:', response.status);
-
-            if (response.status !== 200 || !response.data) {
-                console.warn('[KomgaScraper] [Bangumi] Failed to get subject detail');
-                return null;
+        const legacy = await safeBangumiRequest(function() { return searchBangumiViaLegacy(keyword); });
+        if (legacy.ok) {
+            if (legacy.results.length > 0) {
+                // v0 报错时说明降级原因；v0 只是没匹配到时用更中性的措辞
+                lastBangumiSearchNotice = v0Failed
+                    ? 'Bangumi v0 接口当前不可用，已使用旧版接口搜索'
+                    : 'Bangumi v0 接口无匹配结果，已使用旧版接口搜索';
+                if (debug) console.log('[KomgaScraper] [Bangumi] legacy search succeeded:', legacy.results.length);
+                return legacy.results;
             }
-
-            const data = response.data;
-            const infobox = data.infobox || [];
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Infobox:', JSON.stringify(infobox));
-
-            const isbnRaw = extractFromInfobox(infobox, ['ISBN', 'isbn', 'Isbn']);
-            let isbn = '';
-            if (isbnRaw) {
-                isbn = normalizeIsbn(isbnRaw);
-            }
-
-            const dateExcludePatterns = ['商', '社', '者', '国家', '地区', '语言', '定价', '价格'];
-            let publishDate = extractFromInfobox(
-                infobox,
-                ['发售日期', '发售日', '发售', '发行日期', '发行日', '出版日期', '出版年', '出版'],
-                dateExcludePatterns,
-                looksLikeDate
-            );
-            if (!publishDate && data.date && looksLikeDate(data.date)) publishDate = data.date;
-            if (!publishDate && data.air_date && looksLikeDate(data.air_date)) publishDate = data.air_date;
-
-            const pagesRaw = extractFromInfobox(
-                infobox,
-                ['页数', '页数', 'page', 'Page', 'p.', 'P.'],
-                ['出版社', '作者', '原作', '脚本']
-            );
-            let pages = '';
-            if (pagesRaw) {
-                const pageMatch = pagesRaw.match(/\d+/);
-                if (pageMatch) pages = pageMatch[0];
-            }
-
-            const authors = extractAllAuthorsFromInfobox(infobox);
-
-            const subjectItemId = String(data.id || '').replace(/[^0-9a-zA-Z]/g, '');
-            const subjectDate = data.date || data.air_date || '';
-            const bangumiLinkUrl = cleanUrl('https://bgm.tv/subject/' + subjectItemId);
-            const rawDetailName = String(data.name || '').trim();
-            const rawDetailNameCn = String(data.name_cn || '').trim();
-            const detail = {
-                id: subjectItemId,
-                title: rawDetailNameCn || rawDetailName,
-                originalTitle: rawDetailName,
-                name: rawDetailName,
-                nameCn: rawDetailNameCn,
-                summary: data.summary || '',
-                image: data.images && data.images.common ? data.images.common : '',
-                largeImage: data.images && data.images.large ? data.images.large : '',
-                rating: data.rating && data.rating.score ? data.rating.score : null,
-                status: subjectDate && subjectDate > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
-                airDate: publishDate || subjectDate || '',
-                url: bangumiLinkUrl,
-                infobox: infobox,
-                isbn: isbn,
-                pages: pages,
-                authors: authors,
-                links: [{ label: 'Bangumi', url: bangumiLinkUrl }]
-            };
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Detail result:', JSON.stringify(detail, null, 2));
-            return detail;
-
-        } catch (e) {
-            console.error('[KomgaScraper] [Bangumi] Failed to fetch subject detail:', e);
-            return null;
-        }
-    }
-
-    async function fetchBangumiSubjectsOfSeries(seriesSubjectId) {
-        try {
-            const config = getConfig();
-            const debug = config.debug;
-
-            if (!seriesSubjectId) return [];
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Fetching subjects of series:', seriesSubjectId);
-
-            const url = BANGUMI_API_BASE + '/v0/subjects/' + encodeURIComponent(seriesSubjectId) + '/subjects';
-
-            const response = await fetchWithRateLimit({
-                method: 'GET',
-                url: url,
-                headers: {
-                    'User-Agent': BANGUMI_USER_AGENT,
-                    'Accept': 'application/json'
-                }
-            });
-
-            if (response.status !== 200 || !response.data) {
-                console.warn('[KomgaScraper] [Bangumi] Failed to list subjects of series:', seriesSubjectId, 'status:', response.status);
-                return [];
-            }
-
-            const list = Array.isArray(response.data) ? response.data : (response.data && Array.isArray(response.data.data) ? response.data.data : []);
-
-            if (debug) console.log('[KomgaScraper] [Bangumi] Got', list.length, 'subjects under series', seriesSubjectId);
-
-            return list.map(function(item) {
-                return {
-                    id: String(item.id || '').replace(/[^0-9a-zA-Z]/g, ''),
-                    name: item.name || '',
-                    nameCn: item.name_cn || '',
-                    date: item.date || '',
-                    volumeNumber: null
-                };
-            });
-
-        } catch (e) {
-            console.error('[KomgaScraper] [Bangumi] Failed to list subjects of series:', e);
+            if (debug) console.log('[KomgaScraper] [Bangumi] legacy search returned no results');
             return [];
         }
+
+        const detail = 'v0 接口：' + describeBangumiFailure(v0Failure) + '；旧版接口：' + describeBangumiFailure(legacy.status);
+        const error = new Error(detail);
+        error.bangumiApiError = true;
+        error.v0Status = v0Failure;
+        error.legacyStatus = legacy.status;
+        console.error('[KomgaScraper] [Bangumi] Search failed:', detail);
+        throw error;
     }
 
+    // ---------------- 7.2 Bangumi 详情（v0 -> 网页 HTML -> 旧版 JSON） ----------------
+
+    /**
+     * 把不同来源（v0 / HTML / 旧版）的数据统一映射为脚本内部的 detail 结构。
+     * raw: { id, name, nameCn, summary, image, largeImage, rating, date, airDate, infobox }
+     */
+    function buildBangumiDetail(raw) {
+        const subjectItemId = String(raw.id || '').replace(/[^0-9a-zA-Z]/g, '');
+        const infobox = Array.isArray(raw.infobox) ? raw.infobox : [];
+
+        const isbnRaw = extractFromInfobox(infobox, ['ISBN', 'isbn', 'Isbn']);
+        let isbn = '';
+        if (isbnRaw) {
+            isbn = normalizeIsbn(isbnRaw);
+        }
+
+        const dateExcludePatterns = ['商', '社', '者', '国家', '地区', '语言', '定价', '价格'];
+        let publishDate = extractFromInfobox(
+            infobox,
+            ['发售日期', '发售日', '发售', '发行日期', '发行日', '出版日期', '出版年', '出版'],
+            dateExcludePatterns,
+            looksLikeDate
+        );
+        if (!publishDate && raw.date && looksLikeDate(raw.date)) publishDate = raw.date;
+        if (!publishDate && raw.airDate && looksLikeDate(raw.airDate)) publishDate = raw.airDate;
+
+        const pagesRaw = extractFromInfobox(
+            infobox,
+            ['页数', 'page', 'Page', 'p.', 'P.'],
+            ['出版社', '作者', '原作', '脚本']
+        );
+        let pages = '';
+        if (pagesRaw) {
+            const pageMatch = pagesRaw.match(/\d+/);
+            if (pageMatch) pages = pageMatch[0];
+        }
+
+        const authors = extractAllAuthorsFromInfobox(infobox);
+
+        const subjectDate = String(raw.date || raw.airDate || '');
+        const bangumiLinkUrl = cleanUrl(BANGUMI_WEB_BASE + '/subject/' + subjectItemId);
+        const rawName = String(raw.name || '').trim();
+        const rawNameCn = String(raw.nameCn || '').trim();
+
+        return {
+            id: subjectItemId,
+            title: rawNameCn || rawName,
+            originalTitle: rawName,
+            name: rawName,
+            nameCn: rawNameCn,
+            summary: raw.summary || '',
+            image: toHttpsUrl(raw.image),
+            largeImage: toHttpsUrl(raw.largeImage),
+            rating: raw.rating != null && raw.rating !== '' ? raw.rating : null,
+            status: subjectDate && subjectDate > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
+            airDate: publishDate || subjectDate || '',
+            url: bangumiLinkUrl,
+            infobox: infobox,
+            isbn: isbn,
+            pages: pages,
+            authors: authors,
+            links: [{ label: BANGUMI_LINK_LABEL, url: bangumiLinkUrl }]
+        };
+    }
+
+    async function fetchBangumiDetailFromV0(subjectIdParam) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const detailUrl = BANGUMI_API_BASE + '/v0/subjects/' + encodeURIComponent(subjectIdParam);
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 detail URL:', detailUrl);
+
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: detailUrl,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            }
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 detail status:', response.status);
+
+        if (response.status !== 200 || !response.data) {
+            markBangumiV0Down(response.status);
+            console.warn('[KomgaScraper] [Bangumi] v0 detail unavailable, status:', response.status);
+            return { ok: false, status: response.status };
+        }
+
+        const data = response.data;
+        const infobox = data.infobox || [];
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 infobox:', JSON.stringify(infobox));
+
+        const subjectDate = data.date || data.air_date || '';
+        return {
+            ok: true,
+            status: 200,
+            data: buildBangumiDetail({
+                id: data.id != null ? data.id : subjectIdParam,
+                name: data.name,
+                nameCn: data.name_cn,
+                summary: data.summary,
+                image: data.images && data.images.common,
+                largeImage: data.images && data.images.large,
+                rating: data.rating && data.rating.score,
+                date: subjectDate,
+                airDate: subjectDate,
+                infobox: infobox
+            })
+        };
+    }
+
+    /**
+     * 从 bgm.tv 条目页解析 infobox 等字段（网页可用性通常优于 v0 接口）。
+     * 关键结构缺失时返回 null，由调用方继续降级。
+     */
+    function parseBangumiSubjectHtml(html, subjectIdParam) {
+        const doc = parseHtmlToDoc(html);
+        if (!doc) return null;
+
+        const infobox = [];
+        const infoboxList = doc.querySelector('#infobox');
+        if (infoboxList) {
+            const items = infoboxList.children;
+            for (let i = 0; i < items.length; i++) {
+                const li = items[i];
+                if (!li || String(li.tagName || '').toUpperCase() !== 'LI') continue;
+                const tip = li.querySelector('span.tip');
+                if (!tip) continue;
+                const key = String(tip.textContent || '').replace(/[:：]\s*$/, '').trim();
+                if (!key) continue;
+
+                // 多值字段（如「别名」）在 li 内以嵌套 ul>li 的形式给出
+                const nested = li.querySelectorAll('ul li');
+                let value;
+                if (nested.length > 0) {
+                    value = [];
+                    for (let n = 0; n < nested.length; n++) {
+                        const text = String(nested[n].textContent || '').trim();
+                        if (text) value.push({ v: text });
+                    }
+                } else {
+                    value = String(li.textContent || '').replace(String(tip.textContent || ''), '').trim();
+                }
+                infobox.push({ key: key, value: value });
+            }
+        }
+
+        const nameEl = doc.querySelector('h1.nameSingle a') || doc.querySelector('h1.nameSingle');
+        const name = nameEl ? String(nameEl.textContent || '').trim() : '';
+        if (!name && infobox.length === 0) return null;
+
+        let nameCn = '';
+        for (let i = 0; i < infobox.length; i++) {
+            if (infobox[i].key === '中文名') {
+                nameCn = String(getInfoboxValue(infobox[i].value) || '').trim();
+                break;
+            }
+        }
+
+        const summaryEl = doc.querySelector('#subject_summary');
+        const summary = summaryEl ? String(summaryEl.textContent || '').trim() : '';
+
+        const coverImg = doc.querySelector('.infobox .cover img') || doc.querySelector('img.cover');
+        const coverLink = doc.querySelector('.infobox a.thickbox.cover') || doc.querySelector('a.thickbox.cover');
+        const image = coverImg ? toHttpsUrl(coverImg.getAttribute('src')) : '';
+        const largeImage = (coverLink ? toHttpsUrl(coverLink.getAttribute('href')) : '') || image;
+
+        let rating = null;
+        const ratingEl = doc.querySelector('#bangumiRating');
+        if (ratingEl) {
+            const ratingText = String(ratingEl.getAttribute('title') || ratingEl.textContent || '').trim();
+            const ratingMatch = ratingText.match(/\d+(\.\d+)?/);
+            if (ratingMatch) rating = parseFloat(ratingMatch[0]);
+        }
+
+        const infoboxDate = extractFromInfobox(
+            infobox,
+            ['发售日期', '发售日', '发售', '发行日期', '发行日', '出版日期', '出版年', '出版'],
+            ['商', '社', '者', '国家', '地区', '语言', '定价', '价格'],
+            looksLikeDate
+        );
+
+        return buildBangumiDetail({
+            id: subjectIdParam,
+            name: name,
+            nameCn: nameCn,
+            summary: summary,
+            image: image,
+            largeImage: largeImage,
+            rating: rating,
+            date: infoboxDate || '',
+            airDate: infoboxDate || '',
+            infobox: infobox
+        });
+    }
+
+    async function fetchBangumiDetailFromWeb(subjectIdParam) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const url = BANGUMI_WEB_BASE + '/subject/' + encodeURIComponent(subjectIdParam);
+        if (debug) console.log('[KomgaScraper] [Bangumi] web detail URL:', url);
+
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: url,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'text/html,application/xhtml+xml',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            }
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] web detail status:', response.status);
+
+        if (response.status !== 200 || !response.raw) {
+            return { ok: false, status: response.status };
+        }
+
+        const detail = parseBangumiSubjectHtml(response.raw, subjectIdParam);
+        if (!detail) {
+            console.warn('[KomgaScraper] [Bangumi] failed to parse subject page:', subjectIdParam);
+            return { ok: false, status: response.status };
+        }
+        return { ok: true, status: 200, data: detail };
+    }
+
+    async function fetchBangumiDetailFromLegacy(subjectIdParam) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const url = BANGUMI_LEGACY_API_BASE + '/subject/' + encodeURIComponent(subjectIdParam) + '?responseGroup=large';
+        if (debug) console.log('[KomgaScraper] [Bangumi] legacy detail URL:', url);
+
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: url,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'application/json',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            }
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] legacy detail status:', response.status);
+
+        if (response.status !== 200 || !response.data) {
+            console.warn('[KomgaScraper] [Bangumi] legacy detail unavailable, status:', response.status);
+            return { ok: false, status: response.status };
+        }
+
+        const data = response.data;
+        return {
+            ok: true,
+            status: 200,
+            data: buildBangumiDetail({
+                id: data.id != null ? data.id : subjectIdParam,
+                name: data.name,
+                nameCn: data.name_cn,
+                summary: data.summary,
+                image: data.images && data.images.common,
+                largeImage: data.images && data.images.large,
+                rating: data.rating && data.rating.score,
+                date: data.air_date || '',
+                airDate: data.air_date || '',
+                infobox: []
+            })
+        };
+    }
+
+    /**
+     * 详情入口：v0 -> 网页 HTML（infobox 最全）-> 旧版 JSON。
+     * 三条链路都失败时返回 null（调用方会退回使用搜索结果）。
+     */
+    async function fetchSubjectDetail(subjectIdParam) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const failures = [];
+
+        if (isBangumiV0Down()) {
+            failures.push('v0 接口：' + describeBangumiFailure(BANGUMI_V0_SKIPPED));
+        } else {
+            const v0 = await safeBangumiRequest(function() { return fetchBangumiDetailFromV0(subjectIdParam); });
+            if (v0.ok) return v0.data;
+            failures.push('v0 接口：' + describeBangumiFailure(v0.status));
+        }
+
+        const web = await safeBangumiRequest(function() { return fetchBangumiDetailFromWeb(subjectIdParam); });
+        if (web.ok) {
+            if (debug) console.log('[KomgaScraper] [Bangumi] detail from bgm.tv page:', subjectIdParam);
+            return web.data;
+        }
+        failures.push('网页：' + describeBangumiFailure(web.status));
+
+        const legacy = await safeBangumiRequest(function() { return fetchBangumiDetailFromLegacy(subjectIdParam); });
+        if (legacy.ok) return legacy.data;
+        failures.push('旧版接口：' + describeBangumiFailure(legacy.status));
+
+        console.error('[KomgaScraper] [Bangumi] Failed to fetch subject detail:', subjectIdParam, failures.join('；'));
+        return null;
+    }
+
+    // ---------------- 7.3 Bangumi 系列关系（v0 -> 网页 offprints） ----------------
+
+    // 官方文档：SubjectRelation.type 为条目类型（1=书籍 2=动画 3=音乐 4=游戏 6=三次元）。
+    // 系列关系里会混入动画、广播剧、相同世界观等条目（如「魔女の旅々19 ドラマ」），
+    // 它们的标题里也可能带卷号，必须过滤掉，否则会与真正的单行本抢同一个卷号。
+    function isBangumiBookRelation(item) {
+        return Number(item && item.type) === 1;
+    }
+
+    function mapBangumiRelation(item) {
+        return {
+            id: String(item.id || '').replace(/[^0-9a-zA-Z]/g, ''),
+            name: item.name || '',
+            nameCn: item.name_cn || '',
+            date: item.date || '',
+            relation: item.relation || '',
+            volumeNumber: null
+        };
+    }
+
+    async function fetchBangumiRelationsV0(seriesSubjectId) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const url = BANGUMI_API_BASE + '/v0/subjects/' + encodeURIComponent(seriesSubjectId) + '/subjects';
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 relations URL:', url);
+
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: url,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'application/json'
+            }
+        });
+
+        if (response.status !== 200 || !response.data) {
+            markBangumiV0Down(response.status);
+            console.warn('[KomgaScraper] [Bangumi] v0 relations unavailable:', seriesSubjectId, 'status:', response.status);
+            return { ok: false, status: response.status, items: [] };
+        }
+
+        const list = Array.isArray(response.data) ? response.data : (response.data && Array.isArray(response.data.data) ? response.data.data : []);
+        if (debug) console.log('[KomgaScraper] [Bangumi] v0 returned', list.length, 'relations');
+
+        // 只保留书籍条目，并让「单行本」排在前面（卷号匹配按顺序取第一条，见 matchBooksByNumber）
+        const books = list.filter(isBangumiBookRelation).sort(function(a, b) {
+            const ra = (a && a.relation) === '单行本' ? 0 : 1;
+            const rb = (b && b.relation) === '单行本' ? 0 : 1;
+            return ra - rb;
+        }).map(mapBangumiRelation);
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] book relations after type filter:', books.length);
+        return { ok: true, status: 200, items: books };
+    }
+
+    async function fetchBangumiRelationsFromWeb(seriesSubjectId) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const url = BANGUMI_WEB_BASE + '/subject/' + encodeURIComponent(seriesSubjectId) + '/offprints';
+        if (debug) console.log('[KomgaScraper] [Bangumi] web offprints URL:', url);
+
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: url,
+            headers: {
+                'User-Agent': BANGUMI_USER_AGENT,
+                'Accept': 'text/html,application/xhtml+xml',
+                'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8'
+            }
+        });
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] web offprints status:', response.status);
+
+        if (response.status !== 200 || !response.raw) {
+            return { ok: false, status: response.status, items: [] };
+        }
+
+        const doc = parseHtmlToDoc(response.raw);
+        if (!doc) return { ok: false, status: response.status, items: [] };
+
+        const nodes = doc.querySelectorAll('#browserItemList li[id^="item_"]');
+        const items = [];
+        for (let i = 0; i < nodes.length; i++) {
+            const li = nodes[i];
+            const id = String(li.getAttribute('id') || '').replace(/^item_/, '');
+            const link = li.querySelector('a.l') || li.querySelector('h3 a');
+            if (!id || !link) continue;
+            const name = String(link.textContent || '').trim();
+            if (!name) continue;
+            const infoEl = li.querySelector('p.info.tip');
+            const info = infoEl ? String(infoEl.textContent || '').trim() : '';
+            items.push({
+                id: id,
+                name: name,
+                nameCn: '',
+                date: info.split('/')[0].trim(),
+                relation: '单行本',
+                volumeNumber: null
+            });
+        }
+
+        if (debug) console.log('[KomgaScraper] [Bangumi] web offprints items:', items.length);
+        return { ok: true, status: 200, items: items };
+    }
+
+    /**
+     * 读取系列下的书籍条目：v0 优先，失败或无书籍条目时回退到网页单行本列表。
+     * 两条链路都因 HTTP/网络错误失败时抛出带 bangumiApiError 标记的错误，
+     * 让调用方能区分「接口不可用」与「真的没有子条目」。
+     */
+    async function fetchBangumiSubjectsOfSeries(seriesSubjectId) {
+        const config = getConfig();
+        const debug = config.debug;
+
+
+        if (!seriesSubjectId) return [];
+
+        const failures = [];
+        let anySuccess = false;
+
+        if (isBangumiV0Down()) {
+            failures.push('v0 接口：' + describeBangumiFailure(BANGUMI_V0_SKIPPED));
+        } else {
+            const v0 = await safeBangumiRequest(function() { return fetchBangumiRelationsV0(seriesSubjectId); });
+            if (v0.ok) {
+                anySuccess = true;
+                if (v0.items.length > 0) return v0.items;
+                if (debug) console.log('[KomgaScraper] [Bangumi] no book relations in v0 result, trying web list');
+            } else {
+                failures.push('v0 接口：' + describeBangumiFailure(v0.status));
+            }
+        }
+
+        const web = await safeBangumiRequest(function() { return fetchBangumiRelationsFromWeb(seriesSubjectId); });
+        if (web.ok) {
+            anySuccess = true;
+            if (web.items.length > 0) return web.items;
+        } else {
+            failures.push('网页：' + describeBangumiFailure(web.status));
+        }
+
+        if (anySuccess) return [];
+
+        const error = new Error(failures.join('；'));
+        error.bangumiApiError = true;
+        console.error('[KomgaScraper] [Bangumi] Failed to list subjects of series:', seriesSubjectId, failures.join('；'));
+        throw error;
+    }
     function normalizeVolumeNumber(name, nameCn) {
         if (!name && !nameCn) return null;
         const candidates = [nameCn, name];
@@ -1746,7 +2234,7 @@
     // 11. 搜索结果选择界面
     // ============================================================
 
-    function showSearchResults(results, onSelect, currentKeyword, onRetry, source) {
+    function showSearchResults(results, onSelect, currentKeyword, onRetry, source, notice) {
         closeAllModals();
 
         const hasResults = results && results.length > 0;
@@ -1797,6 +2285,11 @@
 
         let resultsHtml = '<div style="padding:4px 0;">';
         resultsHtml += '<div style="color:rgba(255,255,255,0.7);font-size:14px;margin-bottom:16px;">找到 ' + results.length + ' 个匹配结果，请选择一个:</div>';
+
+        if (notice) {
+            resultsHtml += '<div style="color:#ffc107;font-size:12px;margin:-8px 0 12px 0;">提示：' +
+                String(notice).replace(/</g, '&lt;') + '</div>';
+        }
 
         results.forEach(function(result, index) {
             let safeImage = '';
@@ -2360,14 +2853,24 @@
             };
 
             let searchResults;
+            let searchNotice = '';
             try {
                 if (isFanza) {
                     searchResults = await scrapeFromFanza(cleanKeyword);
                 } else {
                     searchResults = await scrapeFromBangumi(cleanKeyword);
+                    searchNotice = lastBangumiSearchNotice;
                 }
             } catch (e) {
                 loading.remove();
+                if (e && e.bangumiApiError) {
+                    const retryKeyword = cleanKeyword;
+                    showError('Bangumi 搜索接口不可用', 'Bangumi 接口暂时无法访问（' + (e.message || '未知错误') +
+                        '），通常是 Bangumi 源站问题，请稍后重试', function() {
+                        startScrapeProcess(source, retryKeyword);
+                    });
+                    return;
+                }
                 showError('搜索请求失败', '请检查网络连接', function() {
                     startScrapeProcess(source);
                 });
@@ -2377,7 +2880,7 @@
             loading.remove();
 
             showSearchResults(searchResults, async function(selectedResult) {
-                // showSearchResults 第 3-5 参数用于无结果时修改搜索词重试
+                // showSearchResults 第 3-6 参数用于无结果时修改搜索词重试 / 显示降级提示
                 showLoading('正在获取详细数据...');
                 let detail;
                 if (isFanza) {
@@ -2407,7 +2910,7 @@
 
                     writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData);
                 });
-            }, cleanKeyword, doRetry, source);
+            }, cleanKeyword, doRetry, source, searchNotice);
 
         } catch (e) {
             console.error('[KomgaScraper] Scrape process failed:', e);
@@ -2690,7 +3193,7 @@
             if (!mapped.links || mapped.links.length === 0) {
                 const subjectId = bangumiDetail && bangumiDetail.id;
                 if (subjectId) {
-                    mapped.links = [{ label: 'Bangumi', url: 'https://bgm.tv/subject/' + subjectId }];
+                    mapped.links = [{ label: BANGUMI_LINK_LABEL, url: BANGUMI_WEB_BASE + '/subject/' + subjectId }];
                 }
             }
 
@@ -2826,7 +3329,16 @@
             }
 
             showLoading('正在从 Bangumi 读取系列中的章节列表...');
-            const bangumiSubjectsRaw = await fetchBangumiSubjectsOfSeries(bangumiSubjectId);
+            let bangumiSubjectsRaw;
+            try {
+                bangumiSubjectsRaw = await fetchBangumiSubjectsOfSeries(bangumiSubjectId);
+            } catch (e) {
+                closeAllModals();
+                console.error('[KomgaScraper] [Auto] Bangumi relations unavailable:', e);
+                showError('Bangumi 接口不可用', '无法读取该系列在 Bangumi 上的子条目（' +
+                    (e && e.message ? e.message : '未知错误') + '）；这通常是 Bangumi 源站问题，请稍后重试');
+                return;
+            }
             if (!bangumiSubjectsRaw || bangumiSubjectsRaw.length === 0) {
                 closeAllModals();
                 showError('Bangumi 中没有找到子条目', '无法为该系列下的书籍匹配数据；请确认该 subject id 是否正确');
