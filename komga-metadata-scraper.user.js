@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.6
+// @version      1.2.9
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -88,7 +88,11 @@
             autoLockFields: []
         },
         autoRefresh: true,
-        debug: false
+        debug: false,
+        // 搜索结果相关（必须是顶层键：getConfig() 用 Object.assign 浅合并配置，
+        // 嵌套对象的默认值无法自动补齐，放在子对象里会导致旧配置读不到默认值）
+        searchFetchLimit: 50,      // 单次拉取条数（旧版降级接口硬上限 25）
+        searchVisibleCount: 10     // 弹窗默认显示条数，0 表示显示全部
     };
 
     function getConfig() {
@@ -123,6 +127,26 @@
             config.version = SCRIPT_VERSION;
             saveConfig(config);
         }
+    }
+
+    // 搜索结果相关的配置读取（配置可能被手改成任意值，这里统一收敛到安全范围）
+    const SEARCH_FETCH_LIMIT_MIN = 10;
+    const SEARCH_FETCH_LIMIT_MAX = 100;
+    const SEARCH_VISIBLE_COUNT_MAX = 100;
+    // 旧版降级接口（/search/subject/{keyword}）文档规定 max_results 最多 25
+    const BANGUMI_LEGACY_MAX_RESULTS = 25;
+
+    function getSearchFetchLimit() {
+        const value = parseInt(getConfig().searchFetchLimit, 10);
+        if (isNaN(value)) return defaultConfig.searchFetchLimit;
+        return Math.min(SEARCH_FETCH_LIMIT_MAX, Math.max(SEARCH_FETCH_LIMIT_MIN, value));
+    }
+
+    // 0（或非法值回退后的默认值）表示「显示全部」
+    function getSearchVisibleCount() {
+        const value = parseInt(getConfig().searchVisibleCount, 10);
+        if (isNaN(value)) return defaultConfig.searchVisibleCount;
+        return Math.min(SEARCH_VISIBLE_COUNT_MAX, Math.max(0, value));
     }
 
     // ============================================================
@@ -386,12 +410,33 @@
                 const payload = response.data;
                 const content = Array.isArray(payload) ? payload : (payload && payload.content ? payload.content : []);
                 return content.map(function(book) {
+                    const metadata = book.metadata || {};
+                    const metadataNumber = metadata.number != null ? String(metadata.number).trim() : '';
+                    const fileVolume = extractVolumeNumberFromFileName(book.name || fileNameFromUrl(book.url));
+
+                    // 卷号以文件名解析结果为准：Komga 扫描时会把系列内的书按文件名排序后
+                    // 按位置重编号（见 SeriesLifecycle.sortBooks），因此 BookDto.number 与
+                    // metadata.number 往往只是位置序号（1,2,5,7,10 会被改成 1..5）。
+                    // 只有文件名解析不出卷号时，才退回使用 Komga 已有的 metadata.number。
+                    let volumeNumber = null;
+                    let volumeSource = null;
+                    if (fileVolume != null) {
+                        volumeNumber = fileVolume;
+                        volumeSource = 'filename';
+                    } else if (metadataNumber) {
+                        volumeNumber = metadataNumber;
+                        volumeSource = 'metadata';
+                    }
+
                     return {
                         id: book.id,
                         name: book.name,
-                        number: book.number,
-                        numberSort: book.numberSort,
-                        metadata: book.metadata || {}
+                        url: book.url,
+                        metadata: metadata,
+                        metadataNumber: metadataNumber,
+                        numberLocked: metadata.numberLock === true,
+                        volumeNumber: volumeNumber,
+                        volumeSource: volumeSource
                     };
                 });
             }
@@ -400,6 +445,95 @@
             console.error('[KomgaScraper] Failed to fetch books of series:', e);
             return [];
         }
+    }
+
+    // ------------------------------------------------------------
+    // 系列文件夹名 -> 语言识别（仅用于系列级 language 元数据的自动填充）
+    // ------------------------------------------------------------
+
+    /**
+     * 取 Komga 系列对应的文件夹名。
+     * 优先使用 SeriesDto.url（库内相对路径，最后一段即系列文件夹名）；
+     * url 为空（例如受限用户被隐去）时回退到 series.name。
+     */
+    function getSeriesFolderName(seriesData) {
+        if (!seriesData) return '';
+
+        let segment = '';
+        const rawUrl = String(seriesData.url || '').trim();
+        if (rawUrl) {
+            const trimmed = rawUrl.replace(/[\\/]+$/, '');
+            const parts = trimmed.split(/[\\/]/);
+            segment = parts.length > 0 ? parts[parts.length - 1] : '';
+            if (segment) {
+                try {
+                    segment = decodeURIComponent(segment);
+                } catch (_) { /* 非百分号编码，保持原样 */ }
+            }
+        }
+
+        if (!segment) segment = String(seriesData.name || '');
+        return segment.trim();
+    }
+
+    /**
+     * 按文件夹名的字符属性推断语言代码（BCP47 主语言子标签）。
+     * 判定直接基于完整文件夹名，不做括号剔除（日文名常把标签写在括号里）。
+     * 规则（从高到低）：
+     *   含假名（平假名 / 片假名 / 半角片假名）-> ja
+     *     例：「[全巻セット] ONE PIECE」虽然以英文为主，但含片假名，仍判为 ja
+     *   含谚文（韩文）                        -> ko
+     *   含汉字（且无假名、无谚文）            -> zh
+     *   整名不含以上文字、且只由英文字母构成  -> en（"全字符为英文" 才算纯英文）
+     *   其余（含西里尔 / 希腊 / 阿拉伯等其它文字）-> ''（调用方据此不写入 language）
+     * 已知限制：纯汉字的日文名（如「東京喰種」）无法与中文名区分，会判为 zh。
+     */
+    function detectLanguageFromFolderName(name) {
+        const raw = String(name || '').trim();
+        if (!raw) return '';
+
+        const otherLetterRe = /\p{L}/u;
+        let kana = 0;
+        let hangul = 0;
+        let han = 0;
+        let latin = 0;
+        let otherLetter = 0;
+
+        const chars = Array.from(raw);
+        for (let i = 0; i < chars.length; i++) {
+            const cp = chars[i].codePointAt(0);
+            if ((cp >= 0x3040 && cp <= 0x309F) ||   // 平假名
+                (cp >= 0x30A0 && cp <= 0x30FF) ||   // 片假名
+                (cp >= 0x31F0 && cp <= 0x31FF) ||   // 片假名扩展
+                (cp >= 0xFF66 && cp <= 0xFF9D)) {   // 半角片假名
+                kana++;
+            } else if ((cp >= 0x1100 && cp <= 0x11FF) ||   // 谚文字母
+                       (cp >= 0x3130 && cp <= 0x318F) ||   // 谚文兼容字母
+                       (cp >= 0xA960 && cp <= 0xA97F) ||   // 谚文字母扩展-A
+                       (cp >= 0xAC00 && cp <= 0xD7AF)) {   // 谚文音节
+                hangul++;
+            } else if ((cp >= 0x3400 && cp <= 0x4DBF) ||   // 汉字扩展-A
+                       (cp >= 0x4E00 && cp <= 0x9FFF) ||   // 汉字基本区
+                       (cp >= 0xF900 && cp <= 0xFAFF) ||   // 兼容汉字
+                       (cp >= 0x20000 && cp <= 0x2FFFF)) { // 汉字扩展-B 及以上
+                han++;
+            } else if ((cp >= 0x41 && cp <= 0x5A) ||        // A-Z
+                       (cp >= 0x61 && cp <= 0x7A) ||        // a-z
+                       (cp >= 0x00C0 && cp <= 0x00D6) ||    // 拉丁字母（带变音符号）
+                       (cp >= 0x00D8 && cp <= 0x00F6) ||
+                       (cp >= 0x00F8 && cp <= 0x024F)) {
+                latin++;
+            } else if (otherLetterRe.test(chars[i])) {
+                otherLetter++;
+            }
+        }
+
+        if (kana > 0) return 'ja';
+        if (hangul > 0) return 'ko';
+        if (han > 0) return 'zh';
+        // 只有整名不含其它文字、且全部由英文字母构成时才判为纯英文
+        if (latin > 0 && otherLetter === 0) return 'en';
+        return '';
     }
 
     async function updateSeriesMetadata(seriesId, metadata) {
@@ -755,6 +889,12 @@
             newMetadata.totalBookCount = totalBookCount;
         }
 
+        // 出版社（仅系列级字段：Komga 的书籍元数据 API 不支持 publisher）
+        const publisher = String(bangumiData.publisher || '').trim();
+        if (publisher) {
+            newMetadata.publisher = publisher;
+        }
+
         if (bangumiData.links && bangumiData.links.length > 0) {
             newMetadata.links = bangumiData.links;
         }
@@ -840,8 +980,6 @@
     const BANGUMI_V0_DOWN_TTL_MS = 5 * 60 * 1000;
     const BANGUMI_V0_SKIPPED = 'skipped';
     let bangumiV0DownUntil = 0;
-    // 搜索走了旧版接口时置为提示文案，由 showSearchResults 展示
-    let lastBangumiSearchNotice = '';
 
     function isBangumiV0Down() {
         return Date.now() < bangumiV0DownUntil;
@@ -890,6 +1028,11 @@
             airDate: airDate,
             url: bangumiUrl,
             date: String(raw.date || airDate || ''),
+            // isSeries: Bangumi v0 搜索响应自带字段「是否为书籍系列的主条目」。
+            //   true  = 系列主条目（系列刮削的目标）
+            //   false = 单行本 / 分卷条目（书籍刮削的目标）
+            //   null  = 未知（旧版降级接口不返回该字段），UI 在任何过滤档位下都照常展示
+            isSeries: typeof raw.isSeries === 'boolean' ? raw.isSeries : null,
             links: [{ label: BANGUMI_LINK_LABEL, url: bangumiUrl }]
         };
     }
@@ -900,13 +1043,18 @@
      *   - filter.type: [1] 表示只搜索「书籍」条目
      *   - 不传 filter.nsfw：文档中 true=只返回 R18、false=只返回非 R18，
      *     缺省/null 才是“返回全部”；传 true 会把普通条目全部过滤掉
-     * 返回 { ok, status, results }
+     *   - limit/offset 为分页参数（limit 无文档上限，由配置 searchFetchLimit 控制）
+     * options: { offset, limit }
+     * 返回 { ok, status, results, total }（total 为接口给出的命中总数，缺失为 null）
      */
-    async function searchBangumiViaV0(keyword) {
+    async function searchBangumiViaV0(keyword, options) {
         const config = getConfig();
         const debug = config.debug;
+        const opts = options || {};
+        const offset = Math.max(0, parseInt(opts.offset, 10) || 0);
+        const limit = Math.max(1, parseInt(opts.limit, 10) || getSearchFetchLimit());
 
-        const searchUrl = BANGUMI_API_BASE + '/v0/search/subjects?limit=10';
+        const searchUrl = BANGUMI_API_BASE + '/v0/search/subjects?limit=' + limit + '&offset=' + offset;
         const requestBody = JSON.stringify({
             keyword: keyword,
             sort: 'match',
@@ -936,7 +1084,7 @@
             markBangumiV0Down(response.status);
             console.warn('[KomgaScraper] [Bangumi] v0 search unavailable, status:', response.status,
                 response.raw ? String(response.raw).replace(/\s+/g, ' ').substring(0, 120) : '');
-            return { ok: false, status: response.status, results: [] };
+            return { ok: false, status: response.status, results: [], total: null };
         }
 
         const results = response.data.data.map(function(item) {
@@ -949,30 +1097,42 @@
                 largeImage: item.images && item.images.large,
                 rating: item.rating && item.rating.score,
                 date: item.date || '',
-                airDate: item.date || item.air_date || ''
+                airDate: item.date || item.air_date || '',
+                isSeries: item.series
             });
         });
 
+        const total = typeof response.data.total === 'number' ? response.data.total : null;
+
         if (debug) {
             results.forEach(function(r, index) {
-                console.log('[KomgaScraper] [Bangumi] v0 result ' + (index + 1) + ':', r.title, r.originalTitle);
+                console.log('[KomgaScraper] [Bangumi] v0 result ' + (index + 1) + ':', r.title, r.originalTitle,
+                    '(isSeries=' + String(r.isSeries) + ')');
             });
-            console.log('[KomgaScraper] [Bangumi] v0 total', results.length, 'results found');
+            console.log('[KomgaScraper] [Bangumi] v0 returned', results.length, 'results, total:', total,
+                '(offset ' + offset + ', limit ' + limit + ')');
         }
-        return { ok: true, status: 200, results: results };
+        return { ok: true, status: 200, results: results, total: total };
     }
 
     /**
-     * 旧版搜索（GET /search/subject/{keyword}?type=1&responseGroup=small&max_results=10）
+     * 旧版搜索（GET /search/subject/{keyword}?type=1&responseGroup=small&max_results=25）
      * 用于 v0 接口不可用/无结果时降级；返回结构较简单（无 infobox、无评分）。
-     * 返回 { ok, status, results }
+     * 旧接口不会返回 series 标记（结果 isSeries 恒为 null），也没有命中总数。
+     * options: { offset, limit }（limit 会被收敛到文档规定的上限 25）
+     * 返回 { ok, status, results, total }
      */
-    async function searchBangumiViaLegacy(keyword) {
+    async function searchBangumiViaLegacy(keyword, options) {
         const config = getConfig();
         const debug = config.debug;
+        const opts = options || {};
+        const offset = Math.max(0, parseInt(opts.offset, 10) || 0);
+        const requested = Math.max(1, parseInt(opts.limit, 10) || getSearchFetchLimit());
+        const maxResults = Math.min(requested, BANGUMI_LEGACY_MAX_RESULTS);
 
         const url = BANGUMI_LEGACY_API_BASE + '/search/subject/' + encodeURIComponent(keyword) +
-            '?type=1&responseGroup=small&max_results=10';
+            '?type=1&responseGroup=small&max_results=' + maxResults +
+            (offset > 0 ? '&start=' + offset : '');
 
         if (debug) console.log('[KomgaScraper] [Bangumi] legacy search URL:', url);
 
@@ -990,7 +1150,7 @@
 
         if (response.status !== 200 || !response.data || !Array.isArray(response.data.list)) {
             console.warn('[KomgaScraper] [Bangumi] legacy search failed, status:', response.status);
-            return { ok: false, status: response.status, results: [] };
+            return { ok: false, status: response.status, results: [], total: null };
         }
 
         const results = response.data.list.map(function(item) {
@@ -1008,19 +1168,24 @@
         });
 
         if (debug) console.log('[KomgaScraper] [Bangumi] legacy total', results.length, 'results found');
-        return { ok: true, status: 200, results: results };
+        return { ok: true, status: 200, results: results, total: null };
     }
 
     /**
      * Bangumi 搜索入口：v0 优先，失败或无结果时降级到旧版接口。
      * 两条链路都失败时抛出带 bangumiApiError 标记的错误，
      * 让 UI 能区分“接口不可用”和“真的没有结果”。
+     * options: { offset, limit }（「加载更多」时由 UI 传入 offset）
+     * 返回 { results, total, via, notice }：
+     *   via    —— 'v0' | 'legacy'，UI 仅对 v0 结果提供「加载更多」
+     *   total  —— 命中总数（旧接口未知为 null）
+     *   notice —— 降级提示文案（无降级时为空串）
      */
-    async function scrapeFromBangumi(keyword) {
+    async function scrapeFromBangumi(keyword, options) {
         const config = getConfig();
         const debug = config.debug;
 
-        lastBangumiSearchNotice = '';
+        let notice = '';
 
         let v0Failure = null;
         let v0Failed = false;
@@ -1029,9 +1194,9 @@
             v0Failed = true;
             if (debug) console.log('[KomgaScraper] [Bangumi] v0 marked unavailable, skipping to legacy API');
         } else {
-            const v0 = await safeBangumiRequest(function() { return searchBangumiViaV0(keyword); });
+            const v0 = await safeBangumiRequest(function() { return searchBangumiViaV0(keyword, options); });
             if (v0.ok && v0.results.length > 0) {
-                return v0.results;
+                return { results: v0.results, total: v0.total, via: 'v0', notice: '' };
             }
             if (v0.ok) {
                 if (debug) console.log('[KomgaScraper] [Bangumi] v0 returned no results, trying legacy API');
@@ -1041,18 +1206,25 @@
             }
         }
 
-        const legacy = await safeBangumiRequest(function() { return searchBangumiViaLegacy(keyword); });
+        // 降级链只在首屏有意义：加载更多时不重复降级（分页由 v0 承担）
+        const legacyOpts = options || {};
+        if (legacyOpts.offset > 0) {
+            if (debug) console.log('[KomgaScraper] [Bangumi] legacy fallback skipped for paginated request');
+            return { results: [], total: null, via: 'legacy', notice: '' };
+        }
+
+        const legacy = await safeBangumiRequest(function() { return searchBangumiViaLegacy(keyword, options); });
         if (legacy.ok) {
             if (legacy.results.length > 0) {
                 // v0 报错时说明降级原因；v0 只是没匹配到时用更中性的措辞
-                lastBangumiSearchNotice = v0Failed
+                notice = v0Failed
                     ? 'Bangumi v0 接口当前不可用，已使用旧版接口搜索'
                     : 'Bangumi v0 接口无匹配结果，已使用旧版接口搜索';
                 if (debug) console.log('[KomgaScraper] [Bangumi] legacy search succeeded:', legacy.results.length);
-                return legacy.results;
+                return { results: legacy.results, total: null, via: 'legacy', notice: notice };
             }
             if (debug) console.log('[KomgaScraper] [Bangumi] legacy search returned no results');
-            return [];
+            return { results: [], total: null, via: 'legacy', notice: '' };
         }
 
         const detail = 'v0 接口：' + describeBangumiFailure(v0Failure) + '；旧版接口：' + describeBangumiFailure(legacy.status);
@@ -1103,6 +1275,10 @@
 
         const authors = extractAllAuthorsFromInfobox(infobox);
 
+        // 出版社：Bangumi infobox 中 key 含「出版社」「出版者」「出版商」的条目
+        // （排除「连载杂志」等无关条目；value 可能是数组/对象，由 getInfoboxValue 归一化取首个值）
+        const publisher = extractFromInfobox(infobox, ['出版社', '出版者', '出版商'], ['杂志', '连载']);
+
         const subjectDate = String(raw.date || raw.airDate || '');
         const bangumiLinkUrl = cleanUrl(BANGUMI_WEB_BASE + '/subject/' + subjectItemId);
         const rawName = String(raw.name || '').trim();
@@ -1125,6 +1301,7 @@
             isbn: isbn,
             pages: pages,
             authors: authors,
+            publisher: publisher,
             links: [{ label: BANGUMI_LINK_LABEL, url: bangumiLinkUrl }]
         };
     }
@@ -1519,37 +1696,128 @@
         console.error('[KomgaScraper] [Bangumi] Failed to list subjects of series:', seriesSubjectId, failures.join('；'));
         throw error;
     }
+    // ============================================================
+    // 7.4. 卷号解析（Komga 文件名 / Bangumi 标题共用）
+    // ============================================================
+
+    // 明确的卷标写法，按优先级排列；命中后还要校验卷号范围（1–999，允许 10.5 这类小数）
+    const EXPLICIT_VOLUME_PATTERNS = [
+        /第\s*([0-9]{1,4}(?:\.[0-9]+)?)\s*[巻卷]/,
+        /([0-9]{1,4}(?:\.[0-9]+)?)\s*[巻卷]/,
+        /第\s*([0-9]{1,4}(?:\.[0-9]+)?)\s*[話话回]/,
+        /(?:vol|volume)\.?\s*([0-9]{1,4}(?:\.[0-9]+)?)/i,
+        /#\s*([0-9]{1,4}(?:\.[0-9]+)?)/,
+        /([0-9]{1,4}(?:\.[0-9]+)?)\s*[冊册]/
+    ];
+
+    // 这些扩展名会在解析卷号前去掉（文件名通常已无扩展名，这里只是兜底）。
+    // 不能用 “.\w+” 这种通用写法：「Series 1.5」这类小数卷号会被误当扩展名截断。
+    const FILE_EXTENSION_PATTERN = /\.(cbz|cbr|cb7|cbt|zip|rar|7z|pdf|epub|mobi|azw3?|djvu)$/i;
+
+    /** 全角数字 / 全角小数点 -> 半角（「第１０巻」这类日文命名很常见） */
+    function toHalfWidthDigits(text) {
+        return String(text == null ? '' : text)
+            .replace(/[０-９]/g, function(ch) { return String.fromCharCode(ch.charCodeAt(0) - 0xFEE0); })
+            .replace(/．/g, '.');
+    }
+
+    /** 卷号合法性：必须是 1–999 的有限数字，否则返回 null */
+    function toValidVolumeNumber(value) {
+        const num = Number(value);
+        if (!Number.isFinite(num)) return null;
+        if (num <= 0 || num > 999) return null;
+        return num;
+    }
+
+    /** 显式卷标（第N巻 / N巻 / 第N話 / Vol.N / #N / N冊），命中即返回；否则 null */
+    function parseExplicitVolumeNumber(text) {
+        const normalized = toHalfWidthDigits(text);
+        if (!normalized) return null;
+        for (let i = 0; i < EXPLICIT_VOLUME_PATTERNS.length; i++) {
+            const re = new RegExp(EXPLICIT_VOLUME_PATTERNS[i].source, 'gi');
+            let m;
+            while ((m = re.exec(normalized)) !== null) {
+                const vol = toValidVolumeNumber(m[1]);
+                if (vol != null) return vol;
+                if (m.index === re.lastIndex) re.lastIndex++;   // 防御零宽匹配死循环
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 文本中所有“独立的 1–3 位数字”候选（四位年份如 2020 天然不会被匹配到）。
+     * 前一个字符不能是数字/小数点，后一个字符不能是数字，避免从长数字里截取片段。
+     */
+    function findStandaloneVolumeCandidates(text) {
+        const normalized = toHalfWidthDigits(text);
+        const found = [];
+        if (!normalized) return found;
+        const re = /(?:^|[^0-9.])([0-9]{1,3}(?:\.[0-9]+)?)(?![0-9])/g;
+        let m;
+        while ((m = re.exec(normalized)) !== null) {
+            const vol = toValidVolumeNumber(m[1]);
+            if (vol != null) found.push(vol);
+            if (m.index === re.lastIndex) re.lastIndex++;   // 防御零宽匹配死循环
+        }
+        return found;
+    }
+
+    /** 取 Komga BookDto.url 中的文件名（受限用户只会看到文件名，取到什么用什么） */
+    function fileNameFromUrl(url) {
+        const text = String(url == null ? '' : url).replace(/[\\/]+$/, '');
+        if (!text) return '';
+        const parts = text.split(/[\\/]/);
+        let name = parts[parts.length - 1] || '';
+        try {
+            name = decodeURIComponent(name);
+        } catch (_) { /* 非百分号编码，保持原样 */ }
+        return name;
+    }
+
+    /**
+     * 从 Komga 书籍的文件名（不含扩展名）解析卷号。
+     * 1) 显式卷标：第N巻 / N巻 / 第N話 / Vol.N / #N / N冊
+     * 2) 兜底：文件名中最后一个 1–3 位独立数字（如「Series 10」；四位年份不会被算进来）
+     * 解析不到返回 null，由调用方回退 Komga 已有的 metadata.number。
+     */
+    function extractVolumeNumberFromFileName(fileName) {
+        const raw = String(fileName == null ? '' : fileName).trim();
+        if (!raw) return null;
+        const base = raw.replace(FILE_EXTENSION_PATTERN, '');
+
+        const explicit = parseExplicitVolumeNumber(base);
+        if (explicit != null) return explicit;
+
+        // 文件名里的数字几乎总在卷号位置靠后（前面可能有年份、期刊号等），取最后一个
+        const candidates = findStandaloneVolumeCandidates(base);
+        return candidates.length > 0 ? candidates[candidates.length - 1] : null;
+    }
+
+    /**
+     * Bangumi 条目标题 -> 卷号：显式卷标优先，其次退化为标题中首个 1–3 位独立数字。
+     */
     function normalizeVolumeNumber(name, nameCn) {
         if (!name && !nameCn) return null;
         const candidates = [nameCn, name];
         for (let i = 0; i < candidates.length; i++) {
             const text = String(candidates[i] || '');
             if (!text) continue;
-            // 优先匹配“第 N 卷 / 第 N 话 / Vol.N”之类的明确标识
-            const explicit = text.match(/(?:第|Vol\.?|Volume|卷|话)\s*([0-9]+)/i);
-            if (explicit && explicit[1]) {
-                const vol = parseInt(explicit[1], 10);
-                if (vol > 0 && vol <= 999) return vol;
-            }
-            // 退而求其次：文本中首个合理数字（1-3 位，排除 19xx/20xx 年份）
-            const m = text.match(/(?:^|[^0-9.])([0-9]+)(?:[^0-9.]|$)/);
-            if (m && m[1]) {
-                const digits = m[1];
-                if (digits.length >= 1 && digits.length <= 3) {
-                    const val = parseInt(digits, 10);
-                    if (val > 0 && val <= 999) return val;
-                }
-            }
-            const m2 = text.match(/^([0-9]+)$/);
-            if (m2 && m2[1]) {
-                const digits = m2[1];
-                if (digits.length >= 1 && digits.length <= 3) {
-                    const val = parseInt(digits, 10);
-                    if (val > 0 && val <= 999) return val;
-                }
-            }
+            const explicit = parseExplicitVolumeNumber(text);
+            if (explicit != null) return explicit;
+            const found = findStandaloneVolumeCandidates(text);
+            if (found.length > 0) return found[0];
         }
         return null;
+    }
+
+    /** 卷号归一化：'10.0'、10、'10' 视为同一卷（匹配时按数值等价比较） */
+    function normalizeVolumeKey(value) {
+        if (value === null || value === undefined) return null;
+        const text = String(value).trim();
+        if (!text) return null;
+        const num = Number(text);
+        return Number.isFinite(num) ? String(num) : text;
     }
 
     // ============================================================
@@ -1746,6 +2014,7 @@
             let releaseDate = '';
             let pageCount = '';
             let author = '';
+            let publisher = '';
             const tags = [];
             const infoKeysRaw = {};
 
@@ -1815,6 +2084,9 @@
                 if (/作者|著者|creator|author|作家/i.test(k)) {
                     if (!author) author = val.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
                 }
+                if (/出版社|ブランド|メーカー|レーベル|サークル/i.test(k)) {
+                    if (!publisher) publisher = val.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
+                }
                 if (/シリーズ|series|題材|原作|ジャンル|genre/i.test(k)) {
                     const parts = val.split(/[,，、\/]/).map(function(s) { return s.trim(); }).filter(function(s) { return s && s.length <= 30; });
                     parts.forEach(function(p) {
@@ -1856,6 +2128,7 @@
                 releaseDate: releaseDate,
                 pages: pageCount,
                 authors: author ? [{ name: author, role: 'writer' }] : [],
+                publisher: publisher,
                 tags: tags,
                 isbn: '',
                 url: url,
@@ -1875,6 +2148,12 @@
         newMetadata.title = fanzaData.title || metadata.title;
         newMetadata.summary = fanzaData.summary || metadata.summary;
         newMetadata.status = 'ENDED';
+
+        // 出版社（仅系列级字段：Komga 的书籍元数据 API 不支持 publisher）
+        const fanzaPublisher = String(fanzaData.publisher || '').trim();
+        if (fanzaPublisher) {
+            newMetadata.publisher = fanzaPublisher;
+        }
 
         if (fanzaData.tags && fanzaData.tags.length > 0) {
             newMetadata.tags = fanzaData.tags;
@@ -2028,7 +2307,11 @@
             '@keyframes ks-spin { to { transform: rotate(360deg); } }',
             '.ks-btn-retry { background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.8); }',
             '.ks-btn-retry:hover { background:rgba(255,255,255,0.15); }',
-            '.ks-result-card:hover, .ks-source-card, .ks-field-row { transition: all 0.3s ease; }'
+            '.ks-result-card:hover, .ks-source-card, .ks-field-row { transition: all 0.3s ease; }',
+            '.ks-result-control { display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.6);font-size:12px; }',
+            '.ks-result-select { padding:6px 8px;border-radius:6px;border:1px solid rgba(255,255,255,0.15);background:rgba(0,0,0,0.35);color:#fff;font-size:12px;font-family:inherit;cursor:pointer; }',
+            '.ks-result-select:focus { outline:none;border-color:#667eea; }',
+            '.ks-tooltip { position:fixed;z-index:' + (MODAL_Z_INDEX + 1) + ';max-width:min(480px,80vw);padding:8px 10px;border-radius:8px;background:rgba(18,18,30,0.98);border:1px solid rgba(255,255,255,0.16);box-shadow:0 6px 20px rgba(0,0,0,0.55);color:#fff;font-size:13px;line-height:1.5;white-space:normal;word-break:break-word;pointer-events:none; }'
         ].join('\n');
         document.head.appendChild(style);
         __ksStylesInjected = true;
@@ -2087,6 +2370,7 @@
         modals.forEach(function(modal) {
             modal.remove();
         });
+        destroyTitleTooltip();
     }
 
     function showLoading(message, progress) {
@@ -2234,13 +2518,146 @@
     // 11. 搜索结果选择界面
     // ============================================================
 
-    function showSearchResults(results, onSelect, currentKeyword, onRetry, source, notice) {
+    // 结果类型过滤档位。只有 Bangumi v0 的结果自带 series 标记，
+    // 旧版降级接口与 Fanza 没有这个概念（对应结果 isSeries 为 null）。
+    const RESULT_TYPE_ALL = 'all';
+    const RESULT_TYPE_SERIES = 'series';
+    const RESULT_TYPE_VOLUME = 'volume';
+    const RESULT_TYPE_LABELS = { all: '全部', series: '仅系列', volume: '仅单行本' };
+    // 「显示数量」下拉的预设档位（配置里的自定义值会动态补进去）
+    const RESULT_VISIBLE_PRESETS = [10, 25, 50];
+
+    function escapeHtmlText(value) {
+        return String(value == null ? '' : value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;')
+            .replace(/'/g, '&#39;');
+    }
+
+    // ---------------- 11.1 长标题悬浮提示 ----------------
+    // 结果卡片里的标题行是 nowrap + ellipsis，被截断时用固定定位的提示层显示完整文字。
+    // 提示层挂在 document.body 上（而不是弹窗内部），避免被弹窗的 overflow 裁掉。
+
+    let titleTooltipEl = null;
+    let titleTooltipResizeBound = false;
+
+    function hideTitleTooltip() {
+        if (titleTooltipEl) titleTooltipEl.style.display = 'none';
+    }
+
+    /** 关闭弹窗时清理提示层与全局监听，避免残留 DOM / 监听器 */
+    function destroyTitleTooltip() {
+        hideTitleTooltip();
+        if (titleTooltipResizeBound) {
+            window.removeEventListener('resize', hideTitleTooltip, true);
+            titleTooltipResizeBound = false;
+        }
+        if (titleTooltipEl && titleTooltipEl.parentNode) {
+            titleTooltipEl.parentNode.removeChild(titleTooltipEl);
+        }
+        titleTooltipEl = null;
+    }
+
+    function ensureTitleTooltip() {
+        if (titleTooltipEl && document.body.contains(titleTooltipEl)) return titleTooltipEl;
+
+        titleTooltipEl = document.createElement('div');
+        titleTooltipEl.className = 'ks-tooltip';
+        titleTooltipEl.style.display = 'none';
+        document.body.appendChild(titleTooltipEl);
+
+        if (!titleTooltipResizeBound) {
+            window.addEventListener('resize', hideTitleTooltip, true);
+            titleTooltipResizeBound = true;
+        }
+        return titleTooltipEl;
+    }
+
+    /** 在锚点元素下方显示提示，空间不足时翻到上方，并收敛到视口内 */
+    function showTitleTooltip(anchor, text) {
+        if (!anchor || !text) return;
+
+        const tip = ensureTitleTooltip();
+        tip.textContent = text;
+        tip.style.display = 'block';
+
+        const tipRect = tip.getBoundingClientRect();
+        const anchorRect = anchor.getBoundingClientRect();
+        const margin = 8;
+
+        let top = anchorRect.bottom + 6;
+        if (top + tipRect.height > window.innerHeight - margin) {
+            const above = anchorRect.top - tipRect.height - 6;
+            top = above >= margin ? above : Math.max(margin, window.innerHeight - margin - tipRect.height);
+        }
+
+        let left = anchorRect.left;
+        if (left + tipRect.width > window.innerWidth - margin) {
+            left = window.innerWidth - margin - tipRect.width;
+        }
+        if (left < margin) left = margin;
+
+        tip.style.top = Math.max(margin, top) + 'px';
+        tip.style.left = left + 'px';
+    }
+
+    /**
+     * 绑定标题悬浮提示（事件委托：列表重渲染后无需重新绑定）。
+     * 只有标题真的被 CSS 截断（scrollWidth > clientWidth）时才显示提示。
+     */
+    function bindTitleTooltipDelegates(listEl) {
+        listEl.addEventListener('mouseover', function(e) {
+            const el = e.target && e.target.closest ? e.target.closest('[data-full-text]') : null;
+            if (!el) return;
+            const fullText = el.getAttribute('data-full-text') || '';
+            if (!fullText) return;
+            if (el.scrollWidth <= el.clientWidth + 1) return;   // 没被截断就不提示
+            showTitleTooltip(el, fullText);
+        });
+
+        listEl.addEventListener('mouseout', function(e) {
+            const el = e.target && e.target.closest ? e.target.closest('[data-full-text]') : null;
+            if (!el) return;
+            hideTitleTooltip();
+        });
+
+        // 列表滚动会让提示位置失效，滚动时直接收起
+        listEl.addEventListener('scroll', hideTitleTooltip);
+    }
+
+    /**
+     * 搜索结果选择界面。
+     * context（收成单个对象，避免参数过多）：
+     *   results    —— 已加载的结果数组
+     *   total      —— 接口给出的命中总数（未知传 null）
+     *   via        —— 'v0' | 'legacy'
+     *   source     —— 'bangumi' | 'fanza'
+     *   pageType   —— 'series' | 'book'
+     *   keyword    —— 当前搜索词
+     *   notice     —— 降级提示文案
+     *   onSelect   —— 选中结果后的回调
+     *   onRetry    —— 修改搜索词后重试的回调
+     *   onLoadMore —— 加载下一页的回调（仅 Bangumi v0 提供），
+     *                 接收 offset，返回 Promise<{ results, total }>
+     */
+    function showSearchResults(context) {
         closeAllModals();
 
-        const hasResults = results && results.length > 0;
-        const safeKeyword = String(currentKeyword || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
+        const ctx = context || {};
+        const source = ctx.source || '';
+        const pageType = ctx.pageType || '';
+        const initialResults = Array.isArray(ctx.results) ? ctx.results : [];
+        const keyword = ctx.keyword || '';
+        const notice = ctx.notice || '';
+        const onSelect = ctx.onSelect;
+        const onRetry = ctx.onRetry;
+        const onLoadMore = ctx.onLoadMore;
 
-        if (!hasResults) {
+        const safeKeyword = escapeHtmlText(keyword);
+
+        if (initialResults.length === 0) {
             const retryHtml = `
                 <div style="padding:10px 0;">
                     <div style="text-align:center;font-size:48px;margin-bottom:16px;">🔍</div>
@@ -2283,15 +2700,7 @@
             return;
         }
 
-        let resultsHtml = '<div style="padding:4px 0;">';
-        resultsHtml += '<div style="color:rgba(255,255,255,0.7);font-size:14px;margin-bottom:16px;">找到 ' + results.length + ' 个匹配结果，请选择一个:</div>';
-
-        if (notice) {
-            resultsHtml += '<div style="color:#ffc107;font-size:12px;margin:-8px 0 12px 0;">提示：' +
-                String(notice).replace(/</g, '&lt;') + '</div>';
-        }
-
-        results.forEach(function(result, index) {
+        function buildCardHtml(result, index) {
             let safeImage = '';
             if (result.image) {
                 let imgUrl = String(result.image);
@@ -2307,7 +2716,11 @@
             const safeSummary = String(result.summary || '').replace(/</g, '&lt;').replace(/"/g, '&quot;').substring(0, 120);
             const safeAirDate = String(result.airDate || '').replace(/"/g, '&quot;');
 
-            resultsHtml += `
+            const seriesBadge = typeof result.isSeries === 'boolean'
+                ? `<span style="color:${result.isSeries ? '#4caf50' : 'rgba(255,255,255,0.5)'};background:rgba(255,255,255,0.07);padding:2px 6px;border-radius:4px;">${result.isSeries ? '系列' : '单行本'}</span>`
+                : '';
+
+            return `
                 <div class="ks-result-card" data-index="${index}" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.08);cursor:pointer;transition:all 0.3s ease;">
                     <div style="display:flex;gap:12px;">
                         ${safeImage ? `
@@ -2316,11 +2729,12 @@
                             <div style="width:60px;height:80px;background:rgba(255,255,255,0.05);border-radius:6px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.3);font-size:24px;flex-shrink:0;">📚</div>
                         `}
                         <div style="flex:1;min-width:0;">
-                            <div style="color:#fff;font-size:15px;font-weight:500;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeTitle}</div>
+                            <div class="ks-truncate-text" data-full-text="${escapeHtmlText(result.title)}" style="color:#fff;font-size:15px;font-weight:500;margin-bottom:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeTitle}</div>
                             ${safeOriginal && safeOriginal !== safeTitle ? `
-                                <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeOriginal}</div>
+                                <div class="ks-truncate-text" data-full-text="${escapeHtmlText(result.originalTitle)}" style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">${safeOriginal}</div>
                             ` : ''}
                             <div style="display:flex;gap:8px;align-items:center;font-size:12px;margin-top:6px;flex-wrap:wrap;">
+                                ${seriesBadge}
                                 ${result.rating ? `<span style="color:#ffc107;">★ ${String(result.rating)}</span>` : ''}
                                 ${safeAirDate ? `<span style="color:rgba(255,255,255,0.4);">📅 ${safeAirDate}</span>` : ''}
                             </div>
@@ -2331,35 +2745,231 @@
                     </div>
                 </div>
             `;
+        }
+
+        // 只有 Bangumi v0 的结果带 series 标记，其它情况不提供类型过滤
+        const hasSeriesFlag = source === 'bangumi' && initialResults.some(function(result) {
+            return typeof result.isSeries === 'boolean';
         });
 
-        resultsHtml += '</div>';
-        if (onRetry && currentKeyword) {
-            resultsHtml += `
-                <div style="margin-top:20px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.08);text-align:center;">
-                    <button class="ks-btn ks-btn-retry" id="ks-change-keyword-btn" style="border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.8);">✏️ 修改搜索词重新搜索</button>
-                </div>
-            `;
+        const state = {
+            loaded: initialResults.slice(),
+            total: typeof ctx.total === 'number' ? ctx.total : null,
+            // 系列页默认只看系列主条目，书籍页默认只看单行本 / 分卷
+            typeFilter: !hasSeriesFlag
+                ? RESULT_TYPE_ALL
+                : (pageType === 'series' ? RESULT_TYPE_SERIES : (pageType === 'book' ? RESULT_TYPE_VOLUME : RESULT_TYPE_ALL)),
+            visibleCount: getSearchVisibleCount(),   // 0 表示显示全部
+            loadingMore: false
+        };
+
+        function passesTypeFilter(result) {
+            if (state.typeFilter === RESULT_TYPE_ALL) return true;
+            // 类型未知（旧接口降级 / 非 Bangumi 源）的结果在任何档位下都展示，避免误藏结果
+            if (typeof result.isSeries !== 'boolean') return true;
+            return state.typeFilter === RESULT_TYPE_SERIES ? result.isSeries === true : result.isSeries === false;
         }
+
+        function getFilteredResults() {
+            return state.loaded.filter(passesTypeFilter);
+        }
+
+        function getVisibleResults() {
+            const filtered = getFilteredResults();
+            if (!state.visibleCount || state.visibleCount <= 0) return filtered;
+            return filtered.slice(0, state.visibleCount);
+        }
+
+        function buildVisibleCountOptions() {
+            const values = RESULT_VISIBLE_PRESETS.slice();
+            if (state.visibleCount > 0 && values.indexOf(state.visibleCount) === -1) {
+                values.push(state.visibleCount);
+            }
+            values.sort(function(a, b) { return a - b; });
+            return values.map(function(value) {
+                return '<option value="' + value + '">' + value + '</option>';
+            }).join('') + '<option value="0">全部</option>';
+        }
+
+        const typeFilterHtml = hasSeriesFlag
+            ? `<label class="ks-result-control">
+                   <span>结果类型</span>
+                   <select id="ks-result-type-filter" class="ks-result-select">
+                       ${Object.keys(RESULT_TYPE_LABELS).map(function(key) {
+                           return '<option value="' + key + '">' + RESULT_TYPE_LABELS[key] + '</option>';
+                       }).join('')}
+                   </select>
+               </label>`
+            : '';
+
+        const resultsHtml = `
+            <div style="padding:4px 0;">
+                <div id="ks-results-count" style="color:rgba(255,255,255,0.7);font-size:14px;margin-bottom:12px;"></div>
+                ${notice ? '<div style="color:#ffc107;font-size:12px;margin:-6px 0 12px 0;">提示：' + escapeHtmlText(notice) + '</div>' : ''}
+                <div style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;margin-bottom:12px;">
+                    ${typeFilterHtml}
+                    <label class="ks-result-control">
+                        <span>显示数量</span>
+                        <select id="ks-result-visible-count" class="ks-result-select">${buildVisibleCountOptions()}</select>
+                    </label>
+                </div>
+                <div id="ks-results-list" style="max-height:60vh;overflow-y:auto;padding-right:4px;"></div>
+                <div id="ks-results-empty" style="display:none;padding:16px 0;text-align:center;"></div>
+                <div id="ks-load-more-wrap" style="display:none;margin-top:12px;text-align:center;"></div>
+                ${onRetry && keyword ? `
+                    <div style="margin-top:16px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.08);text-align:center;">
+                        <button class="ks-btn ks-btn-retry" id="ks-change-keyword-btn" style="border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s;background:rgba(255,255,255,0.08);color:rgba(255,255,255,0.8);">✏️ 修改搜索词重新搜索</button>
+                    </div>
+                ` : ''}
+            </div>
+        `;
 
         const modal = createModalBase('搜索结果', resultsHtml, null);
 
-        const resultCards = modal.querySelectorAll('.ks-result-card');
-        resultCards.forEach(function(card) {
-            card.addEventListener('click', function() {
-                const idx = parseInt(card.getAttribute('data-index'));
-                modal.remove();
-                onSelect(results[idx]);
-            });
+        const listEl = modal.querySelector('#ks-results-list');
+        const countEl = modal.querySelector('#ks-results-count');
+        const emptyEl = modal.querySelector('#ks-results-empty');
+        const loadMoreWrap = modal.querySelector('#ks-load-more-wrap');
+        const typeFilterEl = modal.querySelector('#ks-result-type-filter');
+        const visibleCountEl = modal.querySelector('#ks-result-visible-count');
+
+        // 当前实际渲染出来的结果（data-index 以此为下标）
+        let visibleResults = [];
+
+        function updateCountLine() {
+            const filtered = getFilteredResults();
+            let text = state.total != null
+                ? '共 ' + state.total + ' 条结果，已加载 ' + state.loaded.length + ' 条'
+                : '已加载 ' + state.loaded.length + ' 条结果';
+            text += '，当前显示 ' + visibleResults.length + ' 条';
+            if (state.typeFilter !== RESULT_TYPE_ALL) {
+                text += '（过滤：' + RESULT_TYPE_LABELS[state.typeFilter] + '，符合 ' + filtered.length + ' 条）';
+            }
+            countEl.textContent = text;
+        }
+
+        function updateLoadMoreButton() {
+            if (!onLoadMore || state.total == null || state.loaded.length >= state.total) {
+                loadMoreWrap.style.display = 'none';
+                loadMoreWrap.innerHTML = '';
+                return;
+            }
+            loadMoreWrap.style.display = 'block';
+            loadMoreWrap.innerHTML = '<button class="ks-btn ks-btn-secondary" id="ks-load-more-btn">加载更多（还有 ' +
+                (state.total - state.loaded.length) + ' 条）</button>';
+            const btn = document.getElementById('ks-load-more-btn');
+            btn.onclick = function() { handleLoadMore(btn); };
+        }
+
+        function renderResults(options) {
+            const opts = options || {};
+            const prevScrollTop = opts.keepScroll ? listEl.scrollTop : 0;
+
+            visibleResults = getVisibleResults();
+            listEl.innerHTML = visibleResults.map(buildCardHtml).join('');
+
+            if (visibleResults.length === 0) {
+                // 过滤后一条不剩：提示并用一键切回「全部」兜底，而不是伪装成“搜索无结果”
+                listEl.style.display = 'none';
+                emptyEl.style.display = 'block';
+                emptyEl.innerHTML = `
+                    <div style="color:rgba(255,255,255,0.7);font-size:13px;margin-bottom:12px;">
+                        当前过滤条件下没有结果（已加载 ${state.loaded.length} 条）
+                    </div>
+                    <button class="ks-btn ks-btn-secondary" id="ks-show-all-btn">显示全部 ${state.loaded.length} 条结果</button>
+                `;
+                document.getElementById('ks-show-all-btn').onclick = function() {
+                    state.typeFilter = RESULT_TYPE_ALL;
+                    if (typeFilterEl) typeFilterEl.value = RESULT_TYPE_ALL;
+                    renderResults();
+                };
+            } else {
+                listEl.style.display = 'block';
+                emptyEl.style.display = 'none';
+                emptyEl.innerHTML = '';
+            }
+
+            listEl.scrollTop = prevScrollTop;
+            updateCountLine();
+            updateLoadMoreButton();
+        }
+
+        async function handleLoadMore(btn) {
+            if (state.loadingMore) return;
+            state.loadingMore = true;
+            btn.disabled = true;
+            btn.textContent = '加载中...';
+
+            try {
+                const page = await onLoadMore(state.loaded.length);
+                const known = {};
+                const before = state.loaded.length;
+                state.loaded.forEach(function(item) { known[item.id || item.url] = true; });
+                ((page && page.results) || []).forEach(function(item) {
+                    const key = item.id || item.url;
+                    if (key && known[key]) return;
+                    if (key) known[key] = true;
+                    state.loaded.push(item);
+                });
+                if (page && typeof page.total === 'number') state.total = page.total;
+
+                // 服务端这一页没给新数据时收掉按钮，避免反复请求同一个 offset
+                if (state.loaded.length === before && state.total != null && state.total > before) {
+                    state.total = before;
+                }
+
+                // 新加载的结果必须是可见的，否则「加载更多」看起来毫无反应
+                state.visibleCount = 0;
+                if (visibleCountEl) visibleCountEl.value = '0';
+                state.loadingMore = false;
+                renderResults({ keepScroll: true });
+            } catch (e) {
+                console.error('[KomgaScraper] Load more failed:', e);
+                state.loadingMore = false;
+                btn.disabled = false;
+                btn.textContent = '加载失败，点击重试';
+            }
+        }
+
+        if (typeFilterEl) {
+            typeFilterEl.value = state.typeFilter;
+            typeFilterEl.onchange = function() {
+                state.typeFilter = typeFilterEl.value;
+                renderResults();
+            };
+        }
+
+        if (visibleCountEl) {
+            visibleCountEl.value = String(state.visibleCount);
+            visibleCountEl.onchange = function() {
+                state.visibleCount = parseInt(visibleCountEl.value, 10) || 0;
+                renderResults({ keepScroll: true });
+            };
+        }
+
+        listEl.addEventListener('click', function(e) {
+            const card = e.target && e.target.closest ? e.target.closest('.ks-result-card') : null;
+            if (!card) return;
+            const result = visibleResults[parseInt(card.getAttribute('data-index'), 10)];
+            if (!result) return;
+            hideTitleTooltip();
+            modal.remove();
+            onSelect(result);
         });
+
+        bindTitleTooltipDelegates(listEl);
+        // 弹窗整体滚动（含列表内部滚动）时收起提示层，避免提示停在旧位置
+        modal.addEventListener('scroll', hideTitleTooltip, true);
 
         const changeKeywordBtn = document.getElementById('ks-change-keyword-btn');
         if (changeKeywordBtn) {
             changeKeywordBtn.onclick = function() {
                 modal.remove();
-                showSearchResults(null, onSelect, currentKeyword, onRetry, source);
+                showSearchResults(Object.assign({}, ctx, { results: [], total: null }));
             };
         }
+
+        renderResults();
     }
 
     // ============================================================
@@ -2388,6 +2998,18 @@
             return currentMetadata[key + 'Lock'] === true;
         }
 
+        // 语言自动识别：仅系列页、且 Komga 系列当前 language 为空、且未被锁定时，
+        // 按系列文件夹名的字符属性推断语言，作为可勾选字段呈现（不参与标题选择）
+        let detectedLanguage = '';
+        if (pageType === 'series' &&
+            !String(currentMetadata.language || '').trim() &&
+            currentMetadata.languageLock !== true) {
+            detectedLanguage = detectLanguageFromFolderName(getSeriesFolderName(currentData));
+            if (detectedLanguage) {
+                mappedMetadata.language = detectedLanguage;
+            }
+        }
+
         const fields = [
             { key: 'title', label: '标题', type: 'text', value: mappedMetadata.title || '', checked: !isFieldLocked('title'), locked: isFieldLocked('title') },
             { key: 'summary', label: '简介', type: 'textarea', value: mappedMetadata.summary || '', checked: !isFieldLocked('summary'), locked: isFieldLocked('summary') }
@@ -2399,11 +3021,24 @@
             if (mappedMetadata.totalBookCount) {
                 fields.push({ key: 'totalBookCount', label: '书籍总数', type: 'text', value: String(mappedMetadata.totalBookCount), checked: !isFieldLocked('totalBookCount'), locked: isFieldLocked('totalBookCount') });
             }
+            const publisherValue = String(mappedMetadata.publisher || '').trim();
+            if (publisherValue) {
+                fields.push({ key: 'publisher', label: '出版社', type: 'text', value: publisherValue, checked: !isFieldLocked('publisher'), locked: isFieldLocked('publisher') });
+            }
+            if (detectedLanguage) {
+                fields.push({ key: 'language', label: '语言 (按文件夹名识别)', type: 'text', value: detectedLanguage, checked: !isFieldLocked('language'), locked: isFieldLocked('language') });
+            }
         }
 
         if (pageType === 'book') {
-            const currentNumber = currentData != null && currentData.number != null ? String(currentData.number) : '';
-            const currentNumberSort = currentData != null && currentData.numberSort != null ? String(currentData.numberSort) : (currentMetadata.numberSort || currentNumber);
+            // 序号默认填文件名解析出的卷号（Komga 的 metadata.number 往往只是按位置重编号的
+            // 结果，例如 1,2,5,7,10 会变成 1..5），解析不到才退回 Komga 当前值
+            const metadataNumber = currentMetadata.number != null ? String(currentMetadata.number).trim() : '';
+            const parsedVolume = extractVolumeNumberFromFileName(currentData && (currentData.name || fileNameFromUrl(currentData.url)));
+            const currentNumber = parsedVolume != null ? String(parsedVolume) : metadataNumber;
+            const currentNumberSort = parsedVolume != null
+                ? String(parsedVolume)
+                : (currentMetadata.numberSort != null && currentMetadata.numberSort !== '' ? String(currentMetadata.numberSort) : metadataNumber);
             fields.push({ key: 'number', label: '序号', type: 'text', value: currentNumber, checked: !isFieldLocked('number') && !!currentNumber, locked: isFieldLocked('number') });
             fields.push({ key: 'numberSort', label: '排序序号', type: 'text', value: currentNumberSort, checked: !isFieldLocked('numberSort') && !!currentNumberSort, locked: isFieldLocked('numberSort') });
             fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !isFieldLocked('releaseDate') && !!mappedMetadata.releaseDate, locked: isFieldLocked('releaseDate') });
@@ -2582,7 +3217,7 @@
             const selectedFields = {};
             const updatedFields = [];
             const skippedFields = [];
-            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数', publisher: '出版社', language: '语言' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -2713,6 +3348,19 @@
             </div>
 
             <div style="margin-bottom:20px;">
+                <label style="color:#fff;font-size:14px;display:block;margin-bottom:8px;">🔎 搜索结果</label>
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                    <input type="number" id="ks-setting-search-fetch-limit" value="${getSearchFetchLimit()}" min="${SEARCH_FETCH_LIMIT_MIN}" max="${SEARCH_FETCH_LIMIT_MAX}" step="10" style="width:120px;padding:10px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                    <span style="color:rgba(255,255,255,0.7);font-size:13px;">单次拉取条数 (10-100)</span>
+                </div>
+                <div style="display:flex;align-items:center;gap:10px;margin-bottom:8px;">
+                    <input type="number" id="ks-setting-search-visible-count" value="${getSearchVisibleCount()}" min="0" max="${SEARCH_VISIBLE_COUNT_MAX}" step="5" style="width:120px;padding:10px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                    <span style="color:rgba(255,255,255,0.7);font-size:13px;">默认显示条数 (0 = 全部)</span>
+                </div>
+                <div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:4px;">默认拉取 50 条、显示 10 条。弹窗内仍可临时切换显示数量，命中更多时可用「加载更多」继续拉取。</div>
+            </div>
+
+            <div style="margin-bottom:20px;">
                 <div style="display:flex;align-items:center;gap:8px;cursor:pointer;">
                     <input type="checkbox" id="ks-setting-auto-refresh" ${config.autoRefresh ? 'checked' : ''} style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
                     <label for="ks-setting-auto-refresh" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">刮削成功后自动刷新页面</label>
@@ -2750,6 +3398,14 @@
         document.getElementById('ks-save-btn').onclick = function() {
             const newConfig = getConfig();
             newConfig.rateLimit.minInterval = parseInt(document.getElementById('ks-setting-rate-limit').value) || 2000;
+            const fetchLimit = parseInt(document.getElementById('ks-setting-search-fetch-limit').value, 10);
+            newConfig.searchFetchLimit = isNaN(fetchLimit)
+                ? defaultConfig.searchFetchLimit
+                : Math.min(SEARCH_FETCH_LIMIT_MAX, Math.max(SEARCH_FETCH_LIMIT_MIN, fetchLimit));
+            const visibleCount = parseInt(document.getElementById('ks-setting-search-visible-count').value, 10);
+            newConfig.searchVisibleCount = isNaN(visibleCount)
+                ? defaultConfig.searchVisibleCount
+                : Math.min(SEARCH_VISIBLE_COUNT_MAX, Math.max(0, visibleCount));
             newConfig.autoRefresh = document.getElementById('ks-setting-auto-refresh').checked;
             newConfig.debug = document.getElementById('ks-setting-debug').checked;
 
@@ -2810,7 +3466,12 @@
             } else {
                 const isFanza = source === 'fanza';
                 const seriesTitle = currentData.seriesTitle ? currentData.seriesTitle.trim() : '';
-                const bookNumber = currentData.number != null ? String(currentData.number) : '';
+                // 卷号以文件名为准：Komga 的 number 只是按位置重编号的结果，
+                // 用它拼关键词会去搜错误的卷（如第10巻被当成第3巻）
+                const parsedVolume = extractVolumeNumberFromFileName(currentData.name || fileNameFromUrl(currentData.url));
+                const bookNumber = parsedVolume != null
+                    ? String(parsedVolume)
+                    : (currentData.metadata && currentData.metadata.number ? String(currentData.metadata.number).trim() : '');
                 const bookName = (currentData.metadata && currentData.metadata.title) || currentData.name || '';
 
                 if (isFanza) {
@@ -2853,13 +3514,19 @@
             };
 
             let searchResults;
+            let searchTotal = null;
+            let searchVia = '';
             let searchNotice = '';
             try {
                 if (isFanza) {
                     searchResults = await scrapeFromFanza(cleanKeyword);
                 } else {
-                    searchResults = await scrapeFromBangumi(cleanKeyword);
-                    searchNotice = lastBangumiSearchNotice;
+                    // 分页只由 v0 承担：首屏按配置拉取，offset 由「加载更多」传入
+                    const bangumiSearch = await scrapeFromBangumi(cleanKeyword, { offset: 0, limit: getSearchFetchLimit() });
+                    searchResults = bangumiSearch.results;
+                    searchTotal = bangumiSearch.total;
+                    searchVia = bangumiSearch.via;
+                    searchNotice = bangumiSearch.notice;
                 }
             } catch (e) {
                 loading.remove();
@@ -2879,8 +3546,7 @@
 
             loading.remove();
 
-            showSearchResults(searchResults, async function(selectedResult) {
-                // showSearchResults 第 3-6 参数用于无结果时修改搜索词重试 / 显示降级提示
+            const onSelectResult = async function(selectedResult) {
                 showLoading('正在获取详细数据...');
                 let detail;
                 if (isFanza) {
@@ -2910,7 +3576,28 @@
 
                     writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData);
                 });
-            }, cleanKeyword, doRetry, source, searchNotice);
+            };
+
+            // 「加载更多」只在 v0 首屏结果上提供：旧接口降级没有总数、也无法稳定分页
+            const onLoadMore = (!isFanza && searchVia === 'v0')
+                ? async function(offset) {
+                    const page = await scrapeFromBangumi(cleanKeyword, { offset: offset, limit: getSearchFetchLimit() });
+                    return { results: page.results, total: page.total };
+                }
+                : null;
+
+            showSearchResults({
+                results: searchResults,
+                total: searchTotal,
+                via: searchVia,
+                source: source,
+                pageType: pageType,
+                keyword: cleanKeyword,
+                notice: searchNotice,
+                onSelect: onSelectResult,
+                onRetry: doRetry,
+                onLoadMore: onLoadMore
+            });
 
         } catch (e) {
             console.error('[KomgaScraper] Scrape process failed:', e);
@@ -2926,7 +3613,7 @@
             const finalMetadata = {};
             const finalUpdated = [];
             const writtenScalarKeys = [];
-            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数', publisher: '出版社', language: '语言' };
 
             if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
@@ -3069,20 +3756,50 @@
                 }
 
                 if (key === 'number' || key === 'numberSort') {
-                    if (value === null || value === undefined || value === '') {
+                    const text = value === null || value === undefined ? '' : String(value).trim();
+                    if (!text) {
                         // 空值直接忽略，不写回也不加锁
-                    } else {
-                        const num = Number(value);
-                        if (Number.isFinite(num)) {
-                            finalMetadata[key] = num;
-                            finalUpdated.push(fieldLabels[key] || key);
-                            writtenScalarKeys.push(key);
-                        } else if (typeof value === 'string' && value.trim().length > 0) {
-                            // 非数字但非空，按字面保存（极端情况）
-                            finalMetadata[key] = value.trim();
-                            finalUpdated.push(fieldLabels[key] || key);
-                            writtenScalarKeys.push(key);
+                    } else if (key === 'numberSort') {
+                        const sortValue = Number(text);
+                        if (Number.isFinite(sortValue)) {
+                            finalMetadata.numberSort = sortValue;
+                            finalUpdated.push(fieldLabels.numberSort || 'numberSort');
+                            writtenScalarKeys.push('numberSort');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid numberSort value:', value);
                         }
+                    } else {
+                        // Komga 的 number 是字符串字段（BookMetadataUpdateDto.number: String），
+                        // 以字符串提交，避免依赖 Jackson 的数字->字符串隐式转换
+                        finalMetadata.number = text;
+                        finalUpdated.push(fieldLabels.number || 'number');
+                        writtenScalarKeys.push('number');
+                    }
+                    return;
+                }
+
+                // language 只允许 BCP47 形式（Komga 侧有校验，非法值会让整个 PATCH 400）
+                if (key === 'language') {
+                    const lang = String(value || '').trim();
+                    if (/^[a-z]{2,3}(-[A-Za-z0-9]{2,8})*$/i.test(lang)) {
+                        finalMetadata.language = lang;
+                        finalUpdated.push(fieldLabels.language || 'language');
+                        writtenScalarKeys.push('language');
+                    } else if (config.debug) {
+                        console.log('[KomgaScraper] Skipping invalid language value:', value);
+                    }
+                    return;
+                }
+
+                // publisher 为空时跳过（不写回也不加锁），避免误清空 Komga 已有的出版社
+                if (key === 'publisher') {
+                    const publisherValue = String(value || '').trim();
+                    if (publisherValue) {
+                        finalMetadata.publisher = publisherValue;
+                        finalUpdated.push(fieldLabels.publisher || 'publisher');
+                        writtenScalarKeys.push('publisher');
+                    } else if (config.debug) {
+                        console.log('[KomgaScraper] Skipping empty publisher value');
                     }
                     return;
                 }
@@ -3158,20 +3875,30 @@
         const map = {};
         for (let i = 0; i < bangumiBooks.length; i++) {
             const b = bangumiBooks[i];
-            if (b.volumeNumber == null) continue;
-            const key = String(b.volumeNumber);
+            const key = normalizeVolumeKey(b.volumeNumber);
+            if (key == null) continue;
             if (!map[key]) map[key] = b;
+        }
+
+        // 统计 Komga 侧的重复卷号（仅用于确认弹窗提示，不改变匹配结果）
+        const keyCounts = {};
+        for (let k = 0; k < komgaBooks.length; k++) {
+            const key = normalizeVolumeKey(komgaBooks[k].volumeNumber);
+            if (key == null) continue;
+            keyCounts[key] = (keyCounts[key] || 0) + 1;
         }
 
         const result = [];
         for (let j = 0; j < komgaBooks.length; j++) {
             const kb = komgaBooks[j];
-            const num = kb.number != null ? String(kb.number) : null;
-            if (num && map[num]) {
-                result.push({ komgaBook: kb, bangumiBook: map[num] });
-            } else {
-                result.push({ komgaBook: kb, bangumiBook: null });
-            }
+            const key = normalizeVolumeKey(kb.volumeNumber);
+            const matched = key != null ? map[key] : null;
+            result.push({
+                komgaBook: kb,
+                bangumiBook: matched || null,
+                reason: matched ? null : (key == null ? '未识别卷号' : 'Bangumi 无该卷号'),
+                duplicate: key != null && keyCounts[key] > 1
+            });
         }
         return result;
     }
@@ -3181,12 +3908,12 @@
             // 把 Bangumi detail 映射为 Komga 可写字段
             const mapped = mapBangumiToBook(bangumiDetail, (komgaBook && komgaBook.metadata) || {});
 
-            // 保持 Komga 的 number / numberSort 不变（但对未设置者也不强制覆写）
-            if (komgaBook && komgaBook.number != null) {
-                mapped.number = komgaBook.number;
-            }
-            if (komgaBook && komgaBook.numberSort != null) {
-                mapped.numberSort = komgaBook.numberSort;
+            // 卷号：只信任从文件名解析出来的值，并写回 Komga 修正被按位置重编号的序号
+            // （旧实现直接沿用 BookDto.number —— 那只是位置序号，会写回错误的序号并加锁）。
+            // 文件名解析不出卷号、只能靠 metadata.number 兜底匹配的书，不写这两个字段。
+            if (komgaBook && komgaBook.volumeSource === 'filename' && komgaBook.volumeNumber != null) {
+                mapped.number = String(komgaBook.volumeNumber);
+                mapped.numberSort = Number(komgaBook.volumeNumber);
             }
 
             // links 字段：确保写入当前 Bangumi subject 的链接
@@ -3251,14 +3978,65 @@
         }
     }
 
-    function showAutoScrapeConfirm(seriesTitle, totalBooks, matchedBooks, onConfirm) {
+    /**
+     * 自动刮削确认弹窗。
+     * 除了计数，还逐本列出「解析卷号 / Komga 文件名 / 匹配到的 Bangumi 条目」，
+     * 便于在写入前发现错配（未识别卷号、卷号重复、覆盖已锁定序号等）。
+     */
+    function showAutoScrapeConfirm(seriesTitle, pairs, onConfirm) {
         closeAllModals();
         const title = String(seriesTitle || '该系列');
+        const list = Array.isArray(pairs) ? pairs : [];
+        const totalBooks = list.length;
+        const matchedBooks = list.filter(function(p) { return p && p.bangumiBook; }).length;
+
+        const rowsHtml = list.map(function(p) {
+            const kb = (p && p.komgaBook) || {};
+            const bookName = String(kb.name || fileNameFromUrl(kb.url) || '(未命名)');
+            const hasVolume = kb.volumeNumber != null && String(kb.volumeNumber).trim() !== '';
+            const volumeCell = escapeHtmlText(hasVolume ? String(kb.volumeNumber) : '—') +
+                (p && p.duplicate ? '<span style="color:#ffb74d;" title="多本书解析出同一卷号">⚠</span>' : '');
+
+            let rightCell;
+            let noteHtml = '';
+            if (p && p.bangumiBook) {
+                const bangumiName = String(p.bangumiBook.name || '');
+                const bangumiNameCn = String(p.bangumiBook.nameCn || '');
+                const display = bangumiNameCn && bangumiNameCn !== bangumiName
+                    ? bangumiName + '（' + bangumiNameCn + '）'
+                    : (bangumiName || bangumiNameCn);
+                rightCell = '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(display) + '" style="flex:1 1 52%;min-width:0;color:rgba(255,255,255,0.85);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(display) + '</div>';
+                if (kb.volumeSource === 'filename' && kb.numberLocked === true &&
+                    kb.metadataNumber && kb.metadataNumber !== String(kb.volumeNumber)) {
+                    noteHtml = '<div style="color:#ffb74d;font-size:12px;margin-top:2px;">' +
+                        'Komga 序号 ' + escapeHtmlText(kb.metadataNumber) + ' → ' + escapeHtmlText(String(kb.volumeNumber)) + '（已锁定，将被覆盖）' +
+                    '</div>';
+                }
+            } else {
+                rightCell = '<div style="flex:1 1 52%;min-width:0;color:#ffb74d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">未匹配：' +
+                    escapeHtmlText((p && p.reason) || '未匹配') + '（跳过）</div>';
+            }
+
+            return '<div style="padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.06);">' +
+                '<div style="display:flex;gap:8px;align-items:baseline;">' +
+                    '<div style="flex:0 0 46px;text-align:right;color:#4fc3f7;font-weight:600;">' + volumeCell + '</div>' +
+                    '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(bookName) + '" style="flex:1 1 48%;min-width:0;color:rgba(255,255,255,0.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(bookName) + '</div>' +
+                    rightCell +
+                '</div>' + noteHtml +
+            '</div>';
+        }).join('');
+
+        const listHtml =
+            '<div style="color:rgba(255,255,255,0.4);font-size:12px;margin-bottom:6px;">卷号　文件名　→　Bangumi 条目</div>' +
+            '<div id="ks-as-list" style="max-height:240px;overflow-y:auto;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:8px;margin-bottom:16px;">' +
+                (rowsHtml || '<div style="padding:12px;color:rgba(255,255,255,0.5);font-size:13px;text-align:center;">该系列下没有书籍</div>') +
+            '</div>';
+
         const contentHtml =
             '<div style="padding:10px 0;">' +
                 '<div style="text-align:center;font-size:48px;margin-bottom:16px;">🤖</div>' +
                 '<div style="color:#fff;font-size:18px;font-weight:500;text-align:center;margin-bottom:12px;">开始自动刮削</div>' +
-                '<div style="color:rgba(255,255,255,0.7);font-size:14px;text-align:center;margin-bottom:16px;">' + title + '</div>' +
+                '<div style="color:rgba(255,255,255,0.7);font-size:14px;text-align:center;margin-bottom:16px;">' + escapeHtmlText(title) + '</div>' +
                 '<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:12px;margin-bottom:16px;">' +
                     '<div style="color:rgba(255,255,255,0.8);font-size:14px;line-height:1.8;">' +
                         '系列下书籍总数：<span style="color:#fff;font-weight:500;">' + String(totalBooks) + '</span><br/>' +
@@ -3266,9 +4044,11 @@
                         '无法匹配（跳过）：<span style="color:#ffb74d;font-weight:500;">' + String(totalBooks - matchedBooks) + '</span>' +
                     '</div>' +
                 '</div>' +
+                listHtml +
                 '<div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;line-height:1.6;">' +
                     '点击「开始」后将逐本抓取 Bangumi 元数据并写入 Komga；' +
-                    '所有写入的字段会自动在 Komga 中加锁，防止被内置扫描覆盖。' +
+                    '所有写入的字段会自动在 Komga 中加锁，防止被内置扫描覆盖；' +
+                    '文件名解析出卷号的书会顺带把「序号 / 排序序号」修正为该卷号。' +
                 '</div>' +
                 '<div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">' +
                     '<button class="ks-btn ks-btn-secondary" id="ks-as-cancel">取消</button>' +
@@ -3276,6 +4056,11 @@
                 '</div>' +
             '</div>';
         const modal = createModalBase('自动刮削确认', contentHtml, null);
+        const listEl = document.getElementById('ks-as-list');
+        if (listEl) {
+            bindTitleTooltipDelegates(listEl);
+            modal.addEventListener('scroll', hideTitleTooltip, true);
+        }
         document.getElementById('ks-as-cancel').onclick = function() { modal.remove(); };
         document.getElementById('ks-as-confirm').onclick = function() {
             modal.remove();
@@ -3359,11 +4144,10 @@
 
             const pairs = matchBooksByNumber(komgaBooks, bangumiBooks);
             const total = pairs.length;
-            const matchedCount = pairs.filter(function(p) { return p.bangumiBook; }).length;
             const seriesTitle = (seriesData.metadata && seriesData.metadata.title) || seriesData.name || '';
 
-            // 弹出确认框，用户确认后再开始逐本刮削
-            showAutoScrapeConfirm(seriesTitle, total, matchedCount, function() {
+            // 弹出确认框（含逐本映射预览），用户确认后再开始逐本刮削
+            showAutoScrapeConfirm(seriesTitle, pairs, function() {
                 runAutoScrapeLoop(pairs, total);
             });
 
