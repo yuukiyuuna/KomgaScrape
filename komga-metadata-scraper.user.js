@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.9
+// @version      1.2.10
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
@@ -586,17 +586,9 @@
     // 6. 数据映射模块 (Bangumi -> Komga)
     // ============================================================
 
-    function mapBangumiStatus(bangumiStatus) {
-        const statusMap = {
-            'Air': 'ONGOING',
-            'Ongoing': 'ONGOING',
-            '连载中': 'ONGOING',
-            '已完结': 'ENDED',
-            'Ended': 'ENDED'
-        };
-        return statusMap[bangumiStatus] || '';
-    }
-
+    // [STATUS-DETECT-BEGIN]
+    // 说明：以下 getInfoboxValue / detectBangumiStatus 会被临时校验脚本按此标记抽取，
+    // 便于直接拿真实 Bangumi 数据跑判定用例；改动这两个函数时请保留标记。
     function getInfoboxValue(val) {
         if (typeof val === 'string') return val;
         if (Array.isArray(val) && val.length > 0) {
@@ -607,6 +599,72 @@
         if (val && typeof val === 'object' && 'v' in val) return String(val.v);
         return '';
     }
+
+    /**
+     * 判定 Bangumi 条目的连载状态，返回 'ENDED' | 'ONGOING' | null。
+     *
+     * 为什么不能按日期猜：漫画 series 条目的 date / airDate 是「第 1 卷发售日」，
+     * 例如 subject/511859（实际连载中）date=2025-02-07 早于今天，早期版本据此判成已完结。
+     * 实测（v0 接口与网页 infobox 一致）：已完结条目必有「结束 / 连载结束 / 播放结束」等字段，
+     * 连载中条目只有「开始 / 连载开始 / 放送开始」，所以改为按 infobox 字段判定。
+     *
+     * 判定优先级：
+     *   1. 显式状态字段：key 含「状态 / 狀態」，或 key 恰为「连载 / 連載 / 连载中 / 連載中」，
+     *      再按值里的关键字判定（"已完结" 等优先于 "连载中" 等）
+     *   2. 结束字段：key 含「结束 / 結束 / 終了 / 完结 / 完結」（结束、连载结束、播放结束…）
+     *      且值非空 → ENDED
+     *   3. 开始字段：key 含「开始 / 開始」（开始、连载开始、放送开始…）且值非空 → ONGOING
+     *   4. 都不满足 → null（调用方不写入状态，保留 Komga 现值）
+     *
+     * 注意两点：
+     *   · 不再像早期版本那样只要 key 含「连载」（如「连载杂志」）就去扫值里的关键字；
+     *   · 「开始」必须等整张 infobox 扫完才能定论 —— 已完结条目通常是「开始」在前、「结束」在后
+     *     （subject/354229 就是这个顺序），提前返回会把已完结误判成连载中。
+     */
+    function detectBangumiStatus(infobox) {
+        if (!infobox || !Array.isArray(infobox)) return null;
+
+        const ENDED_KEYWORDS = ['已完结', '完结', '完結', '終了', '结束', '結束'];
+        const ONGOING_KEYWORDS = ['连载中', '連載中', '放送中', '进行', '進行'];
+        const END_KEYS = ['结束', '結束', '終了', '完结', '完結'];
+        const START_KEYS = ['开始', '開始'];
+
+        const containsAny = function(text, keywords) {
+            if (!text) return false;
+            for (let i = 0; i < keywords.length; i++) {
+                if (text.indexOf(keywords[i]) !== -1) return true;
+            }
+            return false;
+        };
+
+        let hasStartField = false;
+
+        for (let i = 0; i < infobox.length; i++) {
+            const item = infobox[i];
+            if (!item) continue;
+            const key = String(item.key || '').trim();
+            if (!key) continue;
+            const val = String(getInfoboxValue(item.value) || '').trim();
+
+            // 1) 显式状态字段（如「连载状态: 已完结」）
+            const isStatusKey = key.indexOf('状态') !== -1 || key.indexOf('狀態') !== -1 ||
+                key === '连载' || key === '連載' || key === '连载中' || key === '連載中';
+            if (isStatusKey) {
+                if (containsAny(val, ENDED_KEYWORDS)) return 'ENDED';
+                if (containsAny(val, ONGOING_KEYWORDS)) return 'ONGOING';
+            }
+
+            // 2) 结束字段：只要存在且非空，即可判定完结
+            if (val && containsAny(key, END_KEYS)) return 'ENDED';
+
+            // 3) 开始字段：先记录，扫完整张 infobox 再定论
+            if (val && containsAny(key, START_KEYS)) hasStartField = true;
+        }
+
+        if (hasStartField) return 'ONGOING';
+        return null;
+    }
+    // [STATUS-DETECT-END]
 
     function looksLikeDate(val) {
         if (!val) return false;
@@ -750,25 +808,6 @@
         return '';
     }
 
-    function extractStatusFromInfobox(infobox) {
-        if (!infobox || !Array.isArray(infobox)) return null;
-        for (let i = 0; i < infobox.length; i++) {
-            const item = infobox[i];
-            const key = String(item.key || '');
-            const val = getInfoboxValue(item.value);
-            if (key.indexOf('连载') !== -1 || key.indexOf('状态') !== -1 ||
-                key.indexOf('完结') !== -1 || key.indexOf('结束') !== -1) {
-                if (val.indexOf('完结') !== -1 || val.indexOf('结束') !== -1 || val.indexOf('已完结') !== -1) {
-                    return 'ENDED';
-                }
-                if (val.indexOf('连载') !== -1 || val.indexOf('进行') !== -1 || val.indexOf('播出') !== -1) {
-                    return 'ONGOING';
-                }
-            }
-        }
-        return null;
-    }
-
     function extractAllAuthorsFromInfobox(infobox) {
         if (!infobox || !Array.isArray(infobox)) return [];
 
@@ -879,8 +918,11 @@
 
         newMetadata.summary = bangumiData.summary || metadata.summary;
 
-        const infoboxStatus = extractStatusFromInfobox(bangumiData.infobox);
-        newMetadata.status = infoboxStatus || mapBangumiStatus(bangumiData.status) || metadata.status;
+        // 状态只认 Bangumi infobox 的「开始 / 结束」字段判定结果（详见 detectBangumiStatus）。
+        // 不要退回“按发售日/放送日与今天比较”的猜测：漫画 series 的 date 是第 1 卷发售日，
+        // 连载中的作品会被误判成已完结（subject/511859 即为此 bug）。
+        // bangumiData.status 为空（Bangumi 没有等价信息）时保持 Komga 现值不动。
+        newMetadata.status = bangumiData.status || metadata.status;
 
         // 如果 infobox 中存在「册数」，写入 Komga 的 totalBookCount 字段
         // 未完结的作品通常没有此字段，函数会返回 null，此时不写入
@@ -1024,7 +1066,9 @@
             image: toHttpsUrl(raw.image),
             largeImage: toHttpsUrl(raw.largeImage),
             rating: raw.rating != null && raw.rating !== '' ? raw.rating : null,
-            status: airDate && airDate > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
+            // 搜索结果里没有 infobox，无法判定连载状态，一律留空：
+            // 详情接口全部失败时脚本会退回用搜索结果，留空可避免把猜测当成事实写进 Komga
+            status: '',
             airDate: airDate,
             url: bangumiUrl,
             date: String(raw.date || airDate || ''),
@@ -1279,6 +1323,9 @@
         // （排除「连载杂志」等无关条目；value 可能是数组/对象，由 getInfoboxValue 归一化取首个值）
         const publisher = extractFromInfobox(infobox, ['出版社', '出版者', '出版商'], ['杂志', '连载']);
 
+        // 连载状态只按 infobox 的「开始 / 结束」字段判定。
+        // 不能用 date（漫画 series 的 date 是第 1 卷发售日）与今天比较 —— 连载中的
+        // 作品（如 subject/511859）会因此被误判成已完结，这是本次修复的根因。
         const subjectDate = String(raw.date || raw.airDate || '');
         const bangumiLinkUrl = cleanUrl(BANGUMI_WEB_BASE + '/subject/' + subjectItemId);
         const rawName = String(raw.name || '').trim();
@@ -1294,7 +1341,7 @@
             image: toHttpsUrl(raw.image),
             largeImage: toHttpsUrl(raw.largeImage),
             rating: raw.rating != null && raw.rating !== '' ? raw.rating : null,
-            status: subjectDate && subjectDate > new Date().toISOString().slice(0, 10) ? 'Ongoing' : 'Ended',
+            status: detectBangumiStatus(infobox) || '',
             airDate: publishDate || subjectDate || '',
             url: bangumiLinkUrl,
             infobox: infobox,
@@ -2976,6 +3023,37 @@
     // 12. 元数据预览编辑界面
     // ============================================================
 
+    // Komga 系列状态枚举 -> 中文，仅用于预览弹窗的提示文案
+    const KOMGA_STATUS_LABELS = {
+        ONGOING: '连载中',
+        ENDED: '已完结',
+        ABANDONED: '弃坑',
+        HIATUS: '休载'
+    };
+
+    function formatKomgaStatusLabel(value) {
+        const raw = String(value || '').trim();
+        if (!raw) return '空';
+        return KOMGA_STATUS_LABELS[raw.toUpperCase()] || raw;
+    }
+
+    // 锁定字段的通用提示：预览里默认不勾选，但允许勾选覆盖（覆盖后 Komga 中该字段仍保持锁定）
+    const LOCKED_FIELD_HINT = '已锁定：默认不勾选；勾选后将覆盖 Komga 中的当前值（锁定状态保持不变）。';
+
+    /**
+     * 「状态」字段已锁定时的提示文案：展示 Komga 现值与脚本判定值的差异，
+     * 并说明勾选后会覆盖为脚本判定值（字段在 Komga 中保持锁定）。
+     */
+    function buildStatusLockHint(mappedMetadata, currentMetadata) {
+        if (!mappedMetadata || !currentMetadata) return '';
+        if (currentMetadata.statusLock !== true) return '';
+        const detected = String(mappedMetadata.status || '').trim();
+        const current = String(currentMetadata.status || '').trim();
+        if (!detected || detected.toUpperCase() === current.toUpperCase()) return LOCKED_FIELD_HINT;
+        return 'Komga 当前值：' + formatKomgaStatusLabel(current) + '（已锁定）／脚本判定：' +
+            formatKomgaStatusLabel(detected) + '。勾选后将覆盖为脚本判定值，锁定状态保持不变。';
+    }
+
     function showMetadataPreview(scrapeResult, currentData, pageType, source, onConfirm) {
         closeAllModals();
 
@@ -3017,7 +3095,15 @@
 
         if (pageType === 'series') {
             fields.push({ key: 'titleSort', label: '排序标题', type: 'text', value: currentMetadata.titleSort || mappedMetadata.titleSort || mappedMetadata.title || '', checked: !isFieldLocked('titleSort'), locked: isFieldLocked('titleSort') });
-            fields.push({ key: 'status', label: '状态', type: 'text', value: mappedMetadata.status || '', checked: !isFieldLocked('status') && !!mappedMetadata.status, locked: isFieldLocked('status') });
+            fields.push({
+                key: 'status',
+                label: '状态',
+                type: 'text',
+                value: mappedMetadata.status || '',
+                checked: !isFieldLocked('status') && !!mappedMetadata.status,
+                locked: isFieldLocked('status'),
+                hint: buildStatusLockHint(mappedMetadata, currentMetadata)
+            });
             if (mappedMetadata.totalBookCount) {
                 fields.push({ key: 'totalBookCount', label: '书籍总数', type: 'text', value: String(mappedMetadata.totalBookCount), checked: !isFieldLocked('totalBookCount'), locked: isFieldLocked('totalBookCount') });
             }
@@ -3086,22 +3172,23 @@
             const rowBg = field.locked ? 'rgba(255,255,255,0.015)' : 'rgba(255,255,255,0.03)';
             const rowBorder = field.locked ? 'rgba(255,200,100,0.25)' : 'rgba(255,255,255,0.06)';
             const labelColor = field.locked ? 'rgba(255,255,255,0.5)' : '#fff';
-            const inputDisabled = field.locked ? 'disabled' : '';
-            const checkboxDisabled = field.locked ? 'disabled' : '';
-            const cursorStyle = field.locked ? 'not-allowed' : 'pointer';
-            const inputOpacity = field.locked ? 'opacity:0.55;' : '';
             const lockBadge = field.locked ? `<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>` : '';
+            // 锁定字段：默认不勾选，但允许勾选覆盖（覆盖后 Komga 中该字段仍保持锁定）
+            const hintText = field.hint || (field.locked ? LOCKED_FIELD_HINT : '');
             previewHtml += `
                 <div class="ks-field-row" style="background:${rowBg};border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid ${rowBorder};">
-                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:${cursorStyle};">
-                        <input type="checkbox" class="ks-field-checkbox" data-field="${field.key}" data-locked="${field.locked ? 'true' : 'false'}" ${field.checked ? 'checked' : ''} ${checkboxDisabled} style="width:16px;height:16px;accent-color:#667eea;cursor:${cursorStyle};">
+                    <label style="display:flex;align-items:center;gap:8px;margin-bottom:8px;cursor:pointer;">
+                        <input type="checkbox" class="ks-field-checkbox" data-field="${field.key}" data-locked="${field.locked ? 'true' : 'false'}" ${field.checked ? 'checked' : ''} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
                         <span style="color:${labelColor};font-size:14px;font-weight:500;">${field.label}${lockBadge}</span>
                     </label>
                     ${isTextarea ? `
-                        <textarea class="ks-field-input" data-field="${field.key}" ${inputDisabled} style="width:calc(100% - 16px);min-height:80px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;${inputOpacity}">${safeValue}</textarea>
+                        <textarea class="ks-field-input" data-field="${field.key}" style="width:calc(100% - 16px);min-height:80px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${safeValue}</textarea>
                     ` : `
-                        <input type="text" class="ks-field-input" data-field="${field.key}" value="${safeValue}" ${inputDisabled} style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;${inputOpacity}">
+                        <input type="text" class="ks-field-input" data-field="${field.key}" value="${safeValue}" style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
                     `}
+                    ${hintText ? `
+                        <div style="margin-top:6px;color:#ffb74d;font-size:12px;line-height:1.5;">${escapeHtmlText(hintText)}</div>
+                    ` : ''}
                 </div>
             `;
         });
@@ -3111,9 +3198,10 @@
             previewHtml += `
                 <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
                     <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
-                        <input type="checkbox" class="ks-author-checkbox" ${authorLocked ? 'disabled' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                        <input type="checkbox" class="ks-author-checkbox" ${authorLocked ? '' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
                         <span style="color:#fff;font-size:14px;font-weight:500;">作者 / 作画${authorLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
                     </label>
+                    ${authorLocked ? `<div style="color:#ffb74d;font-size:12px;margin-bottom:8px;line-height:1.5;">${LOCKED_FIELD_HINT}</div>` : ''}
             `;
             mappedMetadata.authors.forEach(function(a, idx) {
                 const safeName = String(a.name || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
@@ -3121,7 +3209,7 @@
                 previewHtml += `
                     <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px;">
                         <span style="color:rgba(255,255,255,0.6);font-size:12px;width:40px;flex-shrink:0;">${safeRole}</span>
-                        <input type="text" class="ks-author-input" data-role="${a.role}" data-idx="${idx}" value="${safeName}" ${authorLocked ? 'disabled' : ''} style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                        <input type="text" class="ks-author-input" data-role="${a.role}" data-idx="${idx}" value="${safeName}" style="flex:1;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
                     </div>
                 `;
             });
@@ -3134,11 +3222,12 @@
             previewHtml += `
                 <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
                     <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
-                        <input type="checkbox" class="ks-tags-checkbox" ${tagsLocked ? 'disabled' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                        <input type="checkbox" class="ks-tags-checkbox" ${tagsLocked ? '' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
                         <span style="color:#fff;font-size:14px;font-weight:500;">标签 (Tags)${tagsLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
                     </label>
+                    ${tagsLocked ? `<div style="color:#ffb74d;font-size:12px;margin-bottom:8px;line-height:1.5;">${LOCKED_FIELD_HINT}</div>` : ''}
                     <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">多个标签请用英文逗号 "," 分隔</div>
-                    <textarea class="ks-tags-input" ${tagsLocked ? 'disabled' : ''} style="width:calc(100% - 16px);min-height:60px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${safeTagText}</textarea>
+                    <textarea class="ks-tags-input" style="width:calc(100% - 16px);min-height:60px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${safeTagText}</textarea>
                 </div>
             `;
         }
@@ -3158,11 +3247,12 @@
                 previewHtml += `
                     <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
                         <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
-                            <input type="checkbox" class="ks-alt-titles-checkbox" ${altTitlesLocked ? 'disabled' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                            <input type="checkbox" class="ks-alt-titles-checkbox" ${altTitlesLocked ? '' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
                             <span style="color:#fff;font-size:14px;font-weight:500;">别名 (Alternate Titles)${altTitlesLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
                         </label>
+                        ${altTitlesLocked ? `<div style="color:#ffb74d;font-size:12px;margin-bottom:8px;line-height:1.5;">${LOCKED_FIELD_HINT}</div>` : ''}
                         <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">每行一个别名，格式: <code style="color:#ffc107;">label|title</code>（例: <code style="color:#ffc107;">中文|我的作品</code>）</div>
-                        <textarea class="ks-alt-titles-input" ${altTitlesLocked ? 'disabled' : ''} style="width:calc(100% - 16px);min-height:60px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${altText}</textarea>
+                        <textarea class="ks-alt-titles-input" style="width:calc(100% - 16px);min-height:60px;padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;resize:vertical;font-family:inherit;line-height:1.5;">${altText}</textarea>
                     </div>
                 `;
             }
@@ -3186,11 +3276,12 @@
             previewHtml += `
                 <div class="ks-field-row" style="background:rgba(255,255,255,0.03);border-radius:8px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.06);">
                     <label style="display:flex;align-items:center;gap:8px;margin-bottom:10px;cursor:pointer;">
-                        <input type="checkbox" class="ks-reading-direction-checkbox" ${rdLocked ? 'disabled' : ''} checked style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
+                        <input type="checkbox" class="ks-reading-direction-checkbox" ${rdLocked ? '' : 'checked'} style="width:16px;height:16px;accent-color:#667eea;cursor:pointer;">
                         <span style="color:#fff;font-size:14px;font-weight:500;">阅读方向 (Reading Direction)${rdLocked ? '<span style="display:inline-block;margin-left:6px;padding:2px 8px;border-radius:10px;background:rgba(255,193,7,0.15);color:#ffc107;font-size:11px;font-weight:500;line-height:1.4;">已锁定</span>' : ''}</span>
                     </label>
+                    ${rdLocked ? `<div style="color:#ffb74d;font-size:12px;margin-bottom:8px;line-height:1.5;">${LOCKED_FIELD_HINT}</div>` : ''}
                     <div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:8px;">默认设置为从右到左，可根据实际漫画类型手动切换</div>
-                    <select class="ks-reading-direction" ${rdLocked ? 'disabled' : ''} style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
+                    <select class="ks-reading-direction" style="width:calc(100% - 16px);padding:8px 10px;border-radius:6px;border:1px solid rgba(255,255,255,0.1);background:rgba(0,0,0,0.3);color:#fff;font-size:13px;font-family:inherit;">
                         ${selectHtml}
                     </select>
                 </div>
@@ -3216,18 +3307,10 @@
             const checkboxes = modal.querySelectorAll('.ks-field-checkbox');
             const selectedFields = {};
             const updatedFields = [];
-            const skippedFields = [];
             const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数', publisher: '出版社', language: '语言' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
-                const isLocked = cb.getAttribute('data-locked') === 'true' || currentMetadata[fieldKey + 'Lock'] === true;
-                if (isLocked) {
-                    if (cb.checked) {
-                        skippedFields.push(fieldKey);
-                    }
-                    return;
-                }
                 if (cb.checked) {
                     const input = modal.querySelector('.ks-field-input[data-field="' + fieldKey + '"]');
                     if (input) {
@@ -3312,10 +3395,6 @@
                         }
                     }
                 }
-            }
-
-            if (config.debug && skippedFields.length > 0) {
-                console.log('[KomgaScraper] Skipped locked fields:', skippedFields);
             }
 
             if (config.debug) console.log('[KomgaScraper] Selected fields for update:', selectedFields);
@@ -3621,10 +3700,6 @@
                 const value = metadata[key];
 
                 if (key === 'pages') return;
-                if (currentMetadata[key + 'Lock'] === true) {
-                    if (config.debug) console.log('[KomgaScraper] Skipping locked field:', key);
-                    return;
-                }
 
                 if (key === 'links') {
                     const existingLinks = Array.isArray(currentMetadata.links) ? currentMetadata.links : [];
@@ -3823,7 +3898,7 @@
             });
 
             if (Object.keys(finalMetadata).length === 0) {
-                showError('无可用字段', '所有勾选的字段都已被锁定或包含无效值，无法写入');
+                showError('无可用字段', '所有勾选的字段都包含无效值，无法写入');
                 return;
             }
 
@@ -3959,7 +4034,7 @@
                         '<div style="color:rgba(255,255,255,0.8);font-size:14px;line-height:1.8;">' +
                             '总书籍数：' + String(total) + '<br/>' +
                             '<span style="color:#4caf50;">成功写入：' + String(successCount) + '</span><br/>' +
-                            '<span style="color:#ffb74d;">未匹配（跳过）：' + String(skippedCount) + '</span><br/>' +
+                            '<span style="color:#ffb74d;">跳过（未匹配或手动取消）：' + String(skippedCount) + '</span><br/>' +
                             (failedCount > 0 ? '<span style="color:#ef5350;">失败：' + String(failedCount) + '</span><br/>' : '') +
                         '</div>' +
                     '</div>' +
@@ -3990,12 +4065,19 @@
         const totalBooks = list.length;
         const matchedBooks = list.filter(function(p) { return p && p.bangumiBook; }).length;
 
-        const rowsHtml = list.map(function(p) {
+        const rowsHtml = list.map(function(p, idx) {
             const kb = (p && p.komgaBook) || {};
+            const selectable = !!(p && p.bangumiBook);
             const bookName = String(kb.name || fileNameFromUrl(kb.url) || '(未命名)');
             const hasVolume = kb.volumeNumber != null && String(kb.volumeNumber).trim() !== '';
             const volumeCell = escapeHtmlText(hasVolume ? String(kb.volumeNumber) : '—') +
                 (p && p.duplicate ? '<span style="color:#ffb74d;" title="多本书解析出同一卷号">⚠</span>' : '');
+
+            // 逐本勾选：有匹配的默认勾选，未匹配的不可勾选（本来就没东西可写）
+            const checkboxCell = '<input type="checkbox" class="ks-as-book-checkbox" data-index="' + String(idx) + '"' +
+                (selectable ? ' checked' : ' disabled') +
+                ' style="flex:0 0 auto;width:16px;height:16px;accent-color:#667eea;' +
+                (selectable ? 'cursor:pointer;' : 'cursor:not-allowed;opacity:0.4;') + '">';
 
             let rightCell;
             let noteHtml = '';
@@ -4018,7 +4100,8 @@
             }
 
             return '<div style="padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.06);">' +
-                '<div style="display:flex;gap:8px;align-items:baseline;">' +
+                '<div style="display:flex;gap:8px;align-items:center;">' +
+                    checkboxCell +
                     '<div style="flex:0 0 46px;text-align:right;color:#4fc3f7;font-weight:600;">' + volumeCell + '</div>' +
                     '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(bookName) + '" style="flex:1 1 48%;min-width:0;color:rgba(255,255,255,0.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(bookName) + '</div>' +
                     rightCell +
@@ -4027,7 +4110,13 @@
         }).join('');
 
         const listHtml =
-            '<div style="color:rgba(255,255,255,0.4);font-size:12px;margin-bottom:6px;">卷号　文件名　→　Bangumi 条目</div>' +
+            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">' +
+                '<label style="display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.7);font-size:12px;cursor:pointer;">' +
+                    '<input type="checkbox" id="ks-as-select-all"' + (matchedBooks > 0 ? ' checked' : ' disabled') +
+                    ' style="width:15px;height:15px;accent-color:#667eea;cursor:pointer;">全选' +
+                '</label>' +
+                '<div style="color:rgba(255,255,255,0.4);font-size:12px;">卷号　文件名　→　Bangumi 条目</div>' +
+            '</div>' +
             '<div id="ks-as-list" style="max-height:240px;overflow-y:auto;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:8px;margin-bottom:16px;">' +
                 (rowsHtml || '<div style="padding:12px;color:rgba(255,255,255,0.5);font-size:13px;text-align:center;">该系列下没有书籍</div>') +
             '</div>';
@@ -4041,15 +4130,18 @@
                     '<div style="color:rgba(255,255,255,0.8);font-size:14px;line-height:1.8;">' +
                         '系列下书籍总数：<span style="color:#fff;font-weight:500;">' + String(totalBooks) + '</span><br/>' +
                         'Bangumi 匹配数：<span style="color:#4caf50;font-weight:500;">' + String(matchedBooks) + '</span><br/>' +
-                        '无法匹配（跳过）：<span style="color:#ffb74d;font-weight:500;">' + String(totalBooks - matchedBooks) + '</span>' +
+                        '无法匹配（跳过）：<span style="color:#ffb74d;font-weight:500;">' + String(totalBooks - matchedBooks) + '</span><br/>' +
+                        '本次将刮削（已勾选）：<span id="ks-as-selected-count" style="color:#4caf50;font-weight:500;">' + String(matchedBooks) + '</span> 本' +
                     '</div>' +
                 '</div>' +
                 listHtml +
                 '<div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;line-height:1.6;">' +
+                    '逐本列表默认全选，可取消不想刮削的书；' +
                     '点击「开始」后将逐本抓取 Bangumi 元数据并写入 Komga；' +
                     '所有写入的字段会自动在 Komga 中加锁，防止被内置扫描覆盖；' +
                     '文件名解析出卷号的书会顺带把「序号 / 排序序号」修正为该卷号。' +
                 '</div>' +
+                '<div id="ks-as-empty-hint" style="display:none;color:#ffb74d;font-size:12px;text-align:center;margin-bottom:12px;">没有可刮削的书（全部未匹配或已取消勾选）</div>' +
                 '<div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">' +
                     '<button class="ks-btn ks-btn-secondary" id="ks-as-cancel">取消</button>' +
                     '<button class="ks-btn ks-btn-primary" id="ks-as-confirm">开始</button>' +
@@ -4061,10 +4153,60 @@
             bindTitleTooltipDelegates(listEl);
             modal.addEventListener('scroll', hideTitleTooltip, true);
         }
+
+        // 逐本勾选的状态联动：全选框、已选计数、开始按钮可用性
+        const bookCheckboxes = modal.querySelectorAll('.ks-as-book-checkbox');
+        const selectAllCb = document.getElementById('ks-as-select-all');
+        const selectedCountEl = document.getElementById('ks-as-selected-count');
+        const confirmBtn = document.getElementById('ks-as-confirm');
+        const emptyHintEl = document.getElementById('ks-as-empty-hint');
+        const selectableCheckboxes = [];
+        bookCheckboxes.forEach(function(cb) {
+            if (!cb.disabled) selectableCheckboxes.push(cb);
+        });
+
+        function refreshSelectionState() {
+            let selected = 0;
+            selectableCheckboxes.forEach(function(cb) {
+                if (cb.checked) selected++;
+            });
+            if (selectedCountEl) selectedCountEl.textContent = String(selected);
+            if (selectAllCb) {
+                selectAllCb.checked = selectableCheckboxes.length > 0 && selected === selectableCheckboxes.length;
+                selectAllCb.indeterminate = selected > 0 && selected < selectableCheckboxes.length;
+                selectAllCb.disabled = selectableCheckboxes.length === 0;
+            }
+            if (confirmBtn) {
+                confirmBtn.disabled = selected === 0;
+                confirmBtn.style.opacity = selected === 0 ? '0.5' : '';
+                confirmBtn.style.cursor = selected === 0 ? 'not-allowed' : 'pointer';
+            }
+            if (emptyHintEl) emptyHintEl.style.display = selected === 0 ? 'block' : 'none';
+        }
+
+        bookCheckboxes.forEach(function(cb) {
+            cb.onchange = refreshSelectionState;
+        });
+        if (selectAllCb) {
+            selectAllCb.onchange = function() {
+                const target = selectAllCb.checked;
+                selectableCheckboxes.forEach(function(cb) { cb.checked = target; });
+                refreshSelectionState();
+            };
+        }
+        refreshSelectionState();
+
         document.getElementById('ks-as-cancel').onclick = function() { modal.remove(); };
         document.getElementById('ks-as-confirm').onclick = function() {
+            if (confirmBtn && confirmBtn.disabled) return;
+            const selectedPairs = [];
+            bookCheckboxes.forEach(function(cb) {
+                if (!cb.checked) return;
+                const idx = parseInt(cb.getAttribute('data-index'), 10);
+                if (!isNaN(idx) && list[idx]) selectedPairs.push(list[idx]);
+            });
             modal.remove();
-            onConfirm();
+            onConfirm(selectedPairs);
         };
     }
 
@@ -4147,8 +4289,8 @@
             const seriesTitle = (seriesData.metadata && seriesData.metadata.title) || seriesData.name || '';
 
             // 弹出确认框（含逐本映射预览），用户确认后再开始逐本刮削
-            showAutoScrapeConfirm(seriesTitle, pairs, function() {
-                runAutoScrapeLoop(pairs, total);
+            showAutoScrapeConfirm(seriesTitle, pairs, function(selectedPairs) {
+                runAutoScrapeLoop(selectedPairs, total);
             });
 
         } catch (e) {
@@ -4156,8 +4298,16 @@
             showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
         }
 
-        async function runAutoScrapeLoop(pairs, total) {
+        // selectedPairs：确认弹窗里勾选的书籍（只有匹配到 Bangumi 条目、且用户没取消的书）；
+        // allBooksCount：该系列下的书籍总数，用于在完成汇总里把「未匹配 / 手动取消」合并成「跳过」。
+        async function runAutoScrapeLoop(selectedPairs, allBooksCount) {
             try {
+                const pairs = Array.isArray(selectedPairs) ? selectedPairs : [];
+                const total = pairs.length;
+                if (total === 0) {
+                    showError('没有可刮削的书', '未选择任何书籍，或所选书籍在 Bangumi 中没有对应条目');
+                    return;
+                }
                 let successCount = 0;
                 let skippedCount = 0;
                 let failedCount = 0;
@@ -4203,8 +4353,9 @@
                     else failedCount++;
                 }
 
-                // 汇总展示
-                showAutoScrapeResultSummary(successCount, skippedCount, failedCount, total);
+                // 完成汇总：「跳过」= 未匹配 + 手动取消 + 循环内跳过，保证 成功 + 跳过 + 失败 = 系列书籍总数
+                skippedCount = Math.max(0, Number(allBooksCount) - successCount - failedCount);
+                showAutoScrapeResultSummary(successCount, skippedCount, failedCount, allBooksCount);
             } catch (e) {
                 console.error('[KomgaScraper] [Auto] Auto scrape loop failed:', e);
                 showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
