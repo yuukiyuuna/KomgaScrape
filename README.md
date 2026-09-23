@@ -10,7 +10,7 @@
 - 支持手动从以下数据源抓取元数据：
   - [Bangumi / 番组计划](https://bgm.tv/) —— 官方 `api.bgm.tv` 接口（推荐）。
   - [Fanza / DMM 同人本](https://www.dmm.co.jp/) —— 页面解析，适用于日式同人志 / 成人向书籍。
-  - [駿河屋](https://www.suruga-ya.jp/) —— **仅作为 Fanza / DMM 的兜底**：只有前者没搜到（0 条结果）或请求失败时才会改搜它，两者不会同时搜索、结果也不混排；每条搜索结果的卡片上都标明了来源（`FANZA/DMM` 或 `駿河屋`）。
+  - [駿河屋](https://www.suruga-ya.jp/) —— **仅作为 Fanza / DMM 的兜底**：只有前者没搜到（0 条结果）或请求失败时才会改搜它，两者不会同时搜索、结果也不混排；每条搜索结果的卡片上都标明了来源（`FANZA/DMM` 或 `駿河屋`）。若本机 IP 被 Cloudflare 拦住，会自动改用「桥接标签页」重取（见 [2.4 駿河屋 被 Cloudflare 拦下时](#24-駿河屋-被-cloudflare-拦下时v1211-起)）。
 - 在 **系列详情页** 额外提供“自动刮削”按钮：按 **书籍文件名解析出的卷号**（`第10巻` / `Vol.3` / `#07` 等）与 Bangumi 系列下卷号 (`/v0/subjects/{id}/subjects`) 匹配，批量写入并在 Komga 中加锁（标题、简介、发售日期、ISBN、作者、来源链接、序号等）。
 - 搜索结果弹窗可按 **系列 / 单行本** 过滤、可调整拉取与显示条数、可「加载更多」，长标题鼠标悬停显示完整书名（见 [2.3 搜索结果弹窗](#23-搜索结果弹窗v128-起)）。
 - 可选快捷键：`Ctrl+Shift+S` 打开刮削菜单；`Ctrl+Shift+,` 打开设置面板。
@@ -27,7 +27,7 @@
 
 4. 保存脚本，刷新 Komga 页面即可看到 “刮削” / “自动刮削” 按钮。
 
-> **Tampermonkey 用户请注意：** 脚本中的 `駿河屋` 兜底源需要 `GM_cookie` 权限（用于复用浏览器里已通过的 Cloudflare 校验 Cookie）。更新脚本后管理器会提示新增权限，请点击允许；否则 `駿河屋` 兜底会被 Cloudflare 拦下。
+> **Tampermonkey 用户请注意：** 脚本中的 `駿河屋` 兜底源需要 `GM_cookie`（复用浏览器里已通过的 Cloudflare 校验 Cookie）以及 `GM_openInTab` / `GM_addValueChangeListener`（被 Cloudflare 拦下时改用「桥接标签页」重取）权限，且 `@match` 里带有 `https://www.suruga-ya.jp/*`。更新脚本后管理器会提示新增权限，请点击允许；否则 `駿河屋` 兜底会被 Cloudflare 拦下。
 
 > 如果访问 `api.bgm.tv` 有困难，可在浏览器级别配置代理把 `api.bgm.tv` / `bgm.tv` 的请求走代理（脚本本身不再做代理处理）。
 
@@ -125,6 +125,19 @@ Bangumi 的 v0 接口（`api.bgm.tv/v0/...`）偶尔会整段不可用（例如�
 
 **长标题悬浮提示**——书名与原名两行仍按单行省略号截断，鼠标移入时用悬浮层显示完整文字：只有真的被截断（`scrollWidth > clientWidth`）时才提示，列表滚动、鼠标移开或弹窗关闭时立即收起。
 
+### 2.4 駿河屋 被 Cloudflare 拦下时（v1.2.11 起）
+
+駿河屋 全站挂在 Cloudflare 后面。如果本机出口 IP 被它判为可疑，**每个请求**都会拿到 `403` + `Just a moment...` 的人机校验页；这类「托管挑战」只有真实浏览器导航才过得去，而 `GM_xmlhttpRequest` 不是浏览器导航（发起方是扩展上下文、缺少 `sec-fetch` 导航类请求头、TLS/HTTP2 指纹也不同），所以**即使你已经在新标签页里手动通过了校验，脚本请求依旧会被当成没过校验**。
+
+脚本对此的处理：直连被拦下时，自动在后台**新开一个真实标签页**访问同一个搜索页 URL，由该标签页（同一份脚本，`@match` 含 `https://www.suruga-ya.jp/*`）在页面就绪后把 HTML 回传，Komga 页照常解析、写回。
+
+- 标签页停在人机校验页时，页面会提示「请切到 駿河屋 标签页完成验证」——切过去点一下「确认」即可，脚本会自动继续。
+- 取到结果后桥接标签页会自动关闭；100 秒内没取到结果会回退成原来的报错。
+- 设置面板可关闭该行为（「駿河屋 被 Cloudflare 拦下时自动开桥接标签页」，默认开启）；关闭后只做直连请求。
+- 若直连与桥接都失败，基本可以确定是出口 IP 被判定为可疑：**只**把 `suruga-ya.jp` 交给代理（换出口 IP）后重试即可，代理不需要写进脚本（换 IP 后校验会重新触发一次，属正常现象）。
+
+> 顺带说明：駿河屋 **没有公开的商品 API**（`api.suruga-ya.jp` 不解析，站内也没有对外的 JSON 搜索接口）。站点搜索框的联想功能由第三方「コトハコ / NaviPlus」（`surugaya-f-s.snva.jp/~surugaya/?action=suggestitem&...`）提供，它不受 Cloudflare 保护、能返回 `itemid / title / url / desc / image / price`，但**只是联想引擎**：长标题（如 `司令・・・笑ってる内にやめような 7`）与多词查询命中数为 0，无法替代搜索，因此脚本仍以搜索列表页 HTML 为准。
+
 ### 3. 快捷键
 
 - `Ctrl + Shift + S`：在系列 / 书籍页面打开刮削菜单。
@@ -176,11 +189,18 @@ Bangumi 的 v0 接口（`api.bgm.tv/v0/...`）偶尔会整段不可用（例如�
 - 刮削结果**仅供你个人整理馆藏使用**，请遵守相关网站的 robots 与使用条款。
 - 自动刮削的默认节流为 **2 秒 / 请求**，可以在设置面板中调节 `rateLimit.minInterval`；若需要更激进的抓取，请自行承担被远端限流的风险。
 - **Fanza / DMM 与駿河屋的页面可能会随时变更 DOM 结构**，一旦解析失败请在本仓库提出 Issue；两者都不支持自动刮削。
-- 駿河屋的商品详情页有 Cloudflare 人机校验，脚本只用搜索列表页的数据；搜索列表页也偶尔会要求校验。脚本会复用你浏览器里已通过的校验 Cookie（`cf_clearance`）——它绑定「浏览器 User-Agent + 出口 IP」，所以务必**在同一个浏览器**里打开一次 `https://www.suruga-ya.jp/search?search_word=test&adult_s=3` 通过校验后立刻重试；若仍被拦下，通常是代理 / VPN 让出口 IP 变化导致校验 Cookie 失效，请关闭代理后直连重试。
+- 駿河屋 全站都有 Cloudflare 人机校验（商品详情页必拦，搜索列表页在本机 IP 被判可疑时也会拦），脚本只用搜索列表页的数据。被拦下时脚本会自动改用「桥接标签页」重取（见 [2.4 駿河屋 被 Cloudflare 拦下时](#24-駿河屋-被-cloudflare-拦下时v1211-起)）；若直连与桥接都失败，可只让 `suruga-ya.jp` 走代理换出口 IP 后重试。
 
 ## 更新日志
 
 ### v1.2.11
+
+- **駿河屋 被 Cloudflare 拦下时改用「桥接标签页」重取**：当本机出口 IP 被 Cloudflare 判定为可疑时，駿河屋 会对**每个请求**下发人机校验（`403` + `Just a moment...`）。这种托管挑战只有真实浏览器导航才过得去，而 `GM_xmlhttpRequest` 不是浏览器导航（发起方是扩展上下文、缺少 `sec-fetch` 导航类请求头、TLS/HTTP2 指纹也不同），因此**即使你在新标签页里手动过了校验，脚本依旧会被拦**——这就是下面那套「复用 `cf_clearance`」在部分网络环境下失效的原因。
+  - 现在脚本把「手动开标签页过校验」这套动作自动化了：直连被拦下时，在后台新开一个真实标签页访问**同一个**搜索页 URL，由该标签页（同一份脚本）在页面就绪后把整页 HTML 通过 `GM_setValue` 回传，Komga 页照常解析与写回。
+  - 若标签页停在人机校验页，Komga 页会提示「请切到 駿河屋 标签页完成验证」，点一下「确认」后脚本自动继续；取到结果后桥接标签页自动关闭，100 秒超时则回退成原有报错。
+  - 新增设置项「駿河屋 被 Cloudflare 拦下时自动开桥接标签页」（默认开启），可在设置面板关闭（关闭后只直连）。
+  - 因为是同一份脚本，元数据块新增 `@match https://www.suruga-ya.jp/*` 与 `GM_openInTab` / `GM_addValueChangeListener` / `GM_removeValueChangeListener` 权限，更新后请在脚本管理器中允许新权限。
+- **文档补充：駿河屋 没有公开商品 API**（`api.suruga-ya.jp` 不解析、站内无对外的 JSON 搜索接口）。站点联想服务用的第三方「コトハコ / NaviPlus」（`surugaya-f-s.snva.jp/~surugaya/?action=suggestitem&...`）虽不受 Cloudflare 保护、能返回 `itemid / title / url / desc / image / price`，但只是联想引擎，长标题与多词关键词命中数为 0，无法替代搜索，故仍以搜索列表页 HTML 为准（详见 [2.4](#24-駿河屋-被-cloudflare-拦下时v1211-起)）。
 
 - **修复 Fanza / DMM 源实际搜不到同人本的问题**：此前搜索走全站接口 `www.dmm.co.jp/search/`，带上默认的 `/sort=date/` 后同人分区会整段消失（实测关键词「オリジナル」返回 0 条同人），这就是很多同人本「没有信息」的根因。现在改用 FANZA 同人专用搜索页 `/dc/doujin/-/search/`，实测可稳定返回结果（每页 120 条）。
   - `GM_xmlhttpRequest` 对外部请求使用 `anonymous: true`，脚本为 FANZA/DMM 与駿河屋显式补上年龄确认 Cookie（FANZA `age_check_done=1`、駿河屋 `safe_search_option=3`），否则只会拿到「年齢認証」页或标题被抹空的商品条目。

@@ -5,9 +5,13 @@
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削（FANZA 无结果时自动回退 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       You
 // @match        {你自己的komga网站地址}
+// @match        https://www.suruga-ya.jp/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
+// @grant        GM_openInTab
+// @grant        GM_addValueChangeListener
+// @grant        GM_removeValueChangeListener
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
 // @grant        GM_cookie
@@ -22,6 +26,12 @@
 // ==/UserScript==
 
 /*
+ * 关于元数据块里的第二个 @match（https://www.suruga-ya.jp/*）：
+ *   · 它是给「桥接标签页」用的（见脚本内模块 0）—— 駿河屋 直连被 Cloudflare 拦下时，
+ *     脚本会开一个真实标签页去取搜索页 HTML，再回传给 Komga 页；
+ *   · 不要删掉它，否则桥接标签页里没有脚本在跑，回传就无从发生；
+ *   · 元数据块里 @match 的取值会一直取到行尾（不留行内注释），改动时请保持一行一个值。
+ *
  * ============================================================
  *  版本号约定（给后续修改此脚本的 AI / 开发者看）
  * ============================================================
@@ -42,6 +52,194 @@
 
 (function() {
     'use strict';
+
+    // ============================================================
+    // 0. 駿河屋「桥接标签页」模块
+    // ============================================================
+    // 【为什么需要它】
+    // 駿河屋（www.suruga-ya.jp）全站挂在 Cloudflare 后面。若本机出口 IP 被 Cloudflare
+    // 判为可疑，任何客户端都会拿到 403 +「Just a moment...」的人机校验页；这是
+    // 「托管挑战」（managed challenge），只有真实浏览器导航才过得去。
+    // 校验成功后下发的 cf_clearance 又绑定「浏览器 UA + 出口 IP + 请求指纹」，
+    // 而 GM_xmlhttpRequest 发出的请求既不是浏览器导航（没有 sec-fetch 导航类请求头、
+    // 发起方是扩展上下文、TLS/HTTP2 指纹也不同），所以即使带上该 Cookie 也会被重新挑战
+    // —— 这就是「在新标签页里手动过了人机验证，脚本依旧 403」的原因。
+    //
+    // 【做法】把「你手动开标签页过验证」这套动作自动化：
+    //   1) Komga 页直连被拦后，把请求写进 GM 存储（komga_scraper_surugaya_bridge_request）；
+    //   2) 用 GM_openInTab 在后台打开目标搜索页 URL；
+    //   3) 本文件的同一份脚本会在駿河屋标签页里运行（@match 里有 suruga-ya.jp），
+    //      发现「当前地址 == 请求记录里的地址」就等页面就绪，把整页 HTML 写回 GM 存储；
+    //   4) Komga 页收到 HTML 后照常解析；若标签页停在人机校验页，桥接页会先回传
+    //      challenge 状态，Komga 页据此提示用户切过去点一下「确认」。
+    // 注意：该模块必须在脚本最前面执行 —— 駿河屋标签页里要「只做桥接、不做 Komga 业务」。
+    const SURUGAYA_BRIDGE_HOST_RE = /(^|\.)suruga-ya\.jp$/i;
+    const SURUGAYA_BRIDGE_REQUEST_KEY = 'komga_scraper_surugaya_bridge_request';
+    const SURUGAYA_BRIDGE_RESULT_KEY = 'komga_scraper_surugaya_bridge_result';
+    const SURUGAYA_BRIDGE_REQUEST_TTL_MS = 120000;  // 请求记录有效期，超过即视为上一次的残留
+    const SURUGAYA_BRIDGE_CHILD_MAX_MS = 90000;     // 桥接页最多等多久页面就绪
+    const SURUGAYA_BRIDGE_TIMEOUT_MS = 100000;      // Komga 页最多等多久结果（要大于子页上限）
+    // Cloudflare 校验页的标题（英文站 / 日文站都覆盖），用来识别「还没过校验」
+    const SURUGAYA_BRIDGE_CHALLENGE_RE = /Just a moment|Attention Required|しばらくお待ちください|確認中/;
+
+    /** 桥接页判定「搜索页已经就绪」：命中列表容器或「該当件数」文案 */
+    function isSurugayaSearchPageReady() {
+        if (document.querySelector('div.item, #search_result, h3.product-name')) return true;
+        const body = document.body;
+        return !!(body && /該当件数/.test(body.innerText || body.textContent || ''));
+    }
+
+    /** 比较键：忽略 URL 哈希，只比 origin + path + query（判断当前页是否就是桥接目标） */
+    function surugayaBridgeUrlKey(url) {
+        try {
+            const parsed = new URL(url, location.href);
+            return parsed.origin + parsed.pathname + parsed.search;
+        } catch (e) {
+            return String(url || '');
+        }
+    }
+
+    /** 桥接功能依赖的 GM API 是否齐全（缺任意一个就退回纯直连） */
+    function surugayaBridgeSupported() {
+        return typeof GM_openInTab === 'function'
+            && typeof GM_setValue === 'function'
+            && typeof GM_getValue === 'function'
+            && typeof GM_addValueChangeListener === 'function';
+    }
+
+    /** 桥接页侧：把结果（或 challenge 提示）写回 GM 存储 */
+    function postSurugayaBridgeResult(result) {
+        try {
+            GM_setValue(SURUGAYA_BRIDGE_RESULT_KEY, Object.assign({ ts: Date.now() }, result));
+        } catch (e) { }
+    }
+
+    /**
+     * 桥接页侧：轮询等待页面就绪，然后回传整页 HTML 并关掉自己。
+     * 页面停在 Cloudflare 校验页时先回传一次 challenge 状态（让 Komga 页提示用户去点确认），
+     * 校验完成后本页会重新加载、脚本重新进来，再正常回传 HTML。
+     */
+    function watchSurugayaBridgePage(request) {
+        const startedAt = Date.now();
+        let challengeNotified = false;
+        const timer = setInterval(function() {
+            let result = null;
+            if (isSurugayaSearchPageReady()) {
+                result = {
+                    id: request.id,
+                    ok: true,
+                    html: document.documentElement.outerHTML,
+                    url: location.href
+                };
+            } else if (SURUGAYA_BRIDGE_CHALLENGE_RE.test(document.title || '')) {
+                if (challengeNotified) return;
+                challengeNotified = true;
+                postSurugayaBridgeResult({ id: request.id, phase: 'challenge' });
+                return;
+            } else if (Date.now() - startedAt > SURUGAYA_BRIDGE_CHILD_MAX_MS) {
+                result = { id: request.id, ok: false, reason: 'timeout' };
+            }
+            if (!result) return;
+            clearInterval(timer);
+            postSurugayaBridgeResult(result);
+            // 结果已回传：关掉自己（脚本打开的标签页一般允许 window.close()；
+            // 关不掉也没关系，Komga 页那边还会调用 GM_openInTab 返回对象的 close()）
+            try { window.close(); } catch (e) { }
+        }, 1000);
+    }
+
+    /** 桥接页侧入口：当前页确实是 Komga 页要求桥接的那个地址时才启动 */
+    function runSurugayaBridgeTab() {
+        let request = null;
+        try {
+            request = GM_getValue(SURUGAYA_BRIDGE_REQUEST_KEY, null);
+        } catch (e) {
+            return;
+        }
+        if (!request || !request.id || !request.url) return;
+        if (Date.now() - (Number(request.ts) || 0) > SURUGAYA_BRIDGE_REQUEST_TTL_MS) return;
+        if (surugayaBridgeUrlKey(request.url) !== surugayaBridgeUrlKey(location.href)) return;
+        watchSurugayaBridgePage(request);
+    }
+
+    // 駿河屋 标签页：只做桥接，不再执行下面的 Komga 业务逻辑
+    if (SURUGAYA_BRIDGE_HOST_RE.test(location.hostname)) {
+        runSurugayaBridgeTab();
+        return;
+    }
+
+    /**
+     * Komga 页侧：开一个真实标签页去取 url 的 HTML，成功返回 HTML 字符串，失败返回 ''。
+     * onChallenge 会在「桥接页停在人机校验页」时被调用一次，用于提示用户去点确认。
+     */
+    function fetchSurugayaViaBridge(url, debug, onChallenge) {
+        return new Promise(function(resolve) {
+            if (!surugayaBridgeSupported()) {
+                if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接不可用：缺少 GM_openInTab / GM_addValueChangeListener 权限');
+                resolve('');
+                return;
+            }
+
+            const id = 'sg' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+            let settled = false;
+            let listenerId = null;
+            let tab = null;
+
+            const finish = function(html) {
+                if (settled) return;
+                settled = true;
+                clearTimeout(timer);
+                if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
+                    try { GM_removeValueChangeListener(listenerId); } catch (e) { }
+                }
+                try { GM_setValue(SURUGAYA_BRIDGE_REQUEST_KEY, null); } catch (e) { }
+                if (tab && typeof tab.close === 'function') {
+                    try { tab.close(); } catch (e) { }
+                }
+                resolve(html || '');
+            };
+
+            const timer = setTimeout(function() {
+                if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接标签页超时，未取到结果');
+                finish('');
+            }, SURUGAYA_BRIDGE_TIMEOUT_MS);
+
+            listenerId = GM_addValueChangeListener(SURUGAYA_BRIDGE_RESULT_KEY, function(name, oldValue, newValue) {
+                if (!newValue || newValue.id !== id) return;
+                if (newValue.phase === 'challenge') {
+                    if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接标签页停在 Cloudflare 人机校验页，等待用户完成');
+                    if (typeof onChallenge === 'function') {
+                        try { onChallenge(); } catch (e) { }
+                    }
+                    return;
+                }
+                if (newValue.ok && newValue.html) {
+                    if (debug) console.log('[KomgaScraper] [Suruga-ya] 桥接标签页取回 HTML，长度:', newValue.html.length);
+                    finish(newValue.html);
+                } else {
+                    if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接标签页失败:', newValue.reason || 'unknown');
+                    finish('');
+                }
+            });
+
+            // 必须先写请求记录再开标签页：桥接页加载时就要能读到它
+            try {
+                GM_setValue(SURUGAYA_BRIDGE_REQUEST_KEY, { id: id, url: url, ts: Date.now() });
+            } catch (e) {
+                console.error('[KomgaScraper] [Suruga-ya] 写入桥接请求失败:', e);
+                finish('');
+                return;
+            }
+
+            try {
+                tab = GM_openInTab(url, { active: false, insert: true });
+                if (debug) console.log('[KomgaScraper] [Suruga-ya] 已打开桥接标签页:', url);
+            } catch (e) {
+                console.error('[KomgaScraper] [Suruga-ya] 打开桥接标签页失败:', e);
+                finish('');
+            }
+        });
+    }
 
     // ============================================================
     // 1. 配置管理模块
@@ -94,7 +292,9 @@
         // 搜索结果相关（必须是顶层键：getConfig() 用 Object.assign 浅合并配置，
         // 嵌套对象的默认值无法自动补齐，放在子对象里会导致旧配置读不到默认值）
         searchFetchLimit: 50,      // 单次拉取条数（旧版降级接口硬上限 25）
-        searchVisibleCount: 10     // 弹窗默认显示条数，0 表示显示全部
+        searchVisibleCount: 10,    // 弹窗默认显示条数，0 表示显示全部
+        // 駿河屋 直连被 Cloudflare 拦下时，是否自动改用「桥接标签页」重取（见文件顶部模块 0）
+        surugayaBridgeTab: true
     };
 
     function getConfig() {
@@ -1919,6 +2119,10 @@
     const SURUGAYA_SEARCH_URL = 'https://www.suruga-ya.jp/search?category=&search_word={keyword}&searchbox=1&adult_s=3';
     // 18 禁条目在未确认年龄时标题与链接会被抹成空串；带上服务端下发的 safe_search_option 才能取到完整条目
     const SURUGAYA_COOKIE = 'safe_search_option=3; safe_search_expired=3';
+    // 直连一旦被 Cloudflare 拦下，短时间内就别再试直连了（省掉每次注定失败的 403）；
+    // 只记在内存里，刷新页面即失效，IP 恢复正常后会自动回到直连
+    const SURUGAYA_DIRECT_BLOCK_COOLDOWN_MS = 5 * 60 * 1000;
+    let surugayaDirectBlockedUntil = 0;
 
     // FANZA 与 駿河屋 的年龄门禁都只能靠显式 Cookie：
     // GM_xmlhttpRequest 对外部请求默认 anonymous:true，不会携带浏览器里的 Cookie
@@ -2580,18 +2784,73 @@
     function describeSurugayaBlocked(reason) {
         if (reason === 'cloudflare') {
             let message = '駿河屋 触发了 Cloudflare 人机校验（HTTP 403 / Just a moment）。'
-                + '脚本会复用你浏览器里已通过的校验 Cookie（cf_clearance），它与「浏览器 User-Agent + 出口 IP」绑定，'
-                + '所以请在本脚本所在的那个浏览器里新开标签访问一次 https://www.suruga-ya.jp/search?search_word=test&adult_s=3 通过校验后立刻重试；'
-                + '若仍失败，通常是代理 / VPN 让出口 IP 变化导致校验 Cookie 失效，请关闭代理后直连重试。';
-            if (!canReadBrowserCookies()) {
+                + '脚本会自动改用「桥接标签页」：新开一个后台标签页去访问同一个搜索页，'
+                + '由那个真实标签页把结果 HTML 回传（只有真实浏览器导航才能过校验）。'
+                + '如果那个标签页停在人机校验页，请切过去点一下「确认」，脚本会自动继续。';
+            if (!surugayaBridgeSupported()) {
+                message += '（当前脚本管理器缺少 GM_openInTab / GM_addValueChangeListener 权限，无法自动开桥接标签页：'
+                    + '请在脚本管理器中更新本脚本并允许新增权限后重试。）';
+            } else if (!canReadBrowserCookies()) {
                 message += /tampermonkey/i.test(getScriptHandler())
                     ? '（当前脚本读不到浏览器 Cookie：需要 Tampermonkey 的 GM_cookie 权限，请在脚本管理器中更新本脚本并允许新增权限后重试。）'
                     : '（当前脚本管理器不支持读取浏览器 Cookie（需要 Tampermonkey 的 GM_cookie 权限），因此无法复用校验 Cookie。）';
             }
+            message += '若始终失败，说明本机出口 IP 被 Cloudflare 判定为可疑：'
+                + '可只让 suruga-ya.jp 走代理 / 代理软件规则换出口 IP 后重试（换 IP 后校验会重新触发一次，属正常现象）。';
             return message;
         }
         if (reason === 'parse') return '駿河屋 结果页结构可能已变更（未解析到任何商品）';
         return '请检查网络连接后重试';
+    }
+
+    /**
+     * 取駿河屋搜索页 HTML。
+     * 1) 先直连：GM_xmlhttpRequest + 浏览器 Cookie 罐里的校验 Cookie（干净 IP 下这一步就够了）；
+     * 2) 被判为人机校验（403 / Just a moment）时，改用「桥接标签页」重取（见文件顶部模块 0）。
+     * 两条路都失败时抛出带 surugayaBlocked 标记的错误。
+     */
+    async function fetchSurugayaSearchHtml(searchUrl, debug) {
+        const skipDirect = Date.now() < surugayaDirectBlockedUntil;
+        if (skipDirect && debug) console.log('[KomgaScraper] [Suruga-ya] 直连刚被 Cloudflare 拦下过，本次直接走桥接标签页');
+
+        let response = { status: 0, raw: '' };
+        if (!skipDirect) {
+            const surugayaOptions = await surugayaRequestOptions();
+
+            response = await fetchWithRateLimit({
+                method: 'GET',
+                url: searchUrl,
+                headers: surugayaOptions.headers,
+                useBrowserUserAgent: true,
+                anonymous: surugayaOptions.anonymous
+            });
+
+            if (debug) console.log('[KomgaScraper] [Suruga-ya] Response status:', response.status);
+        }
+
+        const body = response.raw || '';
+        // Cloudflare 校验页既可能是 403，也可能是 200（标题固定 Just a moment...）
+        const challenged = skipDirect || response.status === 403 || /<title[^>]*>\s*Just a moment/i.test(body);
+        if (!challenged) {
+            if (response.status === 200 && body) return body;
+            throw buildSurugayaBlockedError(
+                'http',
+                '駿河屋 请求失败（HTTP ' + response.status + '）'
+            );
+        }
+
+        if (getConfig().surugayaBridgeTab === false || !surugayaBridgeSupported()) {
+            throw buildSurugayaBlockedError('cloudflare');
+        }
+
+        surugayaDirectBlockedUntil = Date.now() + SURUGAYA_DIRECT_BLOCK_COOLDOWN_MS;
+        if (debug) console.log('[KomgaScraper] [Suruga-ya] 直连被 Cloudflare 拦下，改用桥接标签页重取');
+        const bridged = await fetchSurugayaViaBridge(searchUrl, debug, function() {
+            showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证，脚本会自动继续');
+        });
+        if (bridged) return bridged;
+
+        throw buildSurugayaBlockedError('cloudflare');
     }
 
     /** 返回 { results, total }；被 Cloudflare 拦下时抛出带 surugayaBlocked 标记的错误 */
@@ -2602,32 +2861,7 @@
         const searchUrl = SURUGAYA_SEARCH_URL.replace('{keyword}', encodeURIComponent(keyword));
         if (debug) console.log('[KomgaScraper] [Suruga-ya] Searching for:', keyword, '/ url:', searchUrl);
 
-        // 带上浏览器 Cookie 罐里的 Cloudflare 校验 Cookie，并沿用浏览器真实 UA（见 surugayaRequestOptions）
-        const surugayaOptions = await surugayaRequestOptions();
-
-        const response = await fetchWithRateLimit({
-            method: 'GET',
-            url: searchUrl,
-            headers: surugayaOptions.headers,
-            useBrowserUserAgent: true,
-            anonymous: surugayaOptions.anonymous
-        });
-
-        if (debug) console.log('[KomgaScraper] [Suruga-ya] Response status:', response.status);
-
-        if (response.status !== 200 || !response.raw) {
-            throw buildSurugayaBlockedError(
-                response.status === 403 ? 'cloudflare' : 'http',
-                '駿河屋 请求失败（HTTP ' + response.status + '）'
-            );
-        }
-
-        const html = response.raw;
-
-        // Cloudflare 校验页同样是 200，标题固定是 Just a moment...
-        if (/<title[^>]*>\s*Just a moment/i.test(html)) {
-            throw buildSurugayaBlockedError('cloudflare');
-        }
+        const html = await fetchSurugayaSearchHtml(searchUrl, debug);
 
         const items = parseSurugayaSearchItems(html);
         if (items === null) throw buildSurugayaBlockedError('parse');
@@ -3939,6 +4173,14 @@
                 </div>
             </div>
 
+            <div style="margin-bottom:20px;">
+                <div style="display:flex;align-items:center;gap:8px;cursor:pointer;">
+                    <input type="checkbox" id="ks-setting-surugaya-bridge" ${config.surugayaBridgeTab !== false ? 'checked' : ''} style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
+                    <label for="ks-setting-surugaya-bridge" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">駿河屋 被 Cloudflare 拦下时自动开「桥接标签页」重取</label>
+                </div>
+                <div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:4px;">关闭后，駿河屋 兜底只会直连请求；本机 IP 被人机校验拦住时会直接报错。</div>
+            </div>
+
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1);">
                 <button class="ks-btn ks-btn-secondary" id="ks-reset-btn">恢复默认</button>
                 <button class="ks-btn ks-btn-secondary" id="ks-settings-cancel-btn">取消</button>
@@ -3973,6 +4215,7 @@
                 : Math.min(SEARCH_VISIBLE_COUNT_MAX, Math.max(0, visibleCount));
             newConfig.autoRefresh = document.getElementById('ks-setting-auto-refresh').checked;
             newConfig.debug = document.getElementById('ks-setting-debug').checked;
+            newConfig.surugayaBridgeTab = document.getElementById('ks-setting-surugaya-bridge').checked;
 
             saveConfig(newConfig);
             alert('设置已保存');
