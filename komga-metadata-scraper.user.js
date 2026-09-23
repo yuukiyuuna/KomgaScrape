@@ -1893,8 +1893,21 @@
     const FANZA_DETAIL_BASE = 'https://www.dmm.co.jp/dc/doujin/-/detail/=/cid=';
     const FANZA_SEARCH_LIMITS = [30, 60, 120];
 
-    // 详情页「ジャンル」里混着受众/营销标记，作为标签没有意义
-    const FANZA_TAG_BLOCKLIST = ['男性向け', '女性向け', '成人向け', '新作', 'イチオシ', 'セール', '無料', 'ポイント', '割引'];
+    // 详情页「ジャンル」里混着受众/营销标记与年龄分级，作为标签没有意义
+    // （成人向け / 全年齢向け 是分级信息，改由 ageRating 承载，见下方 ADULT_AGE_RATING）
+    const FANZA_TAG_BLOCKLIST = ['男性向け', '女性向け', '成人向け', '全年齢向け', '新作', 'イチオシ', 'セール', '無料', 'ポイント', '割引'];
+
+    // 限制级统一写 Komga 的 ageRating=18（Komga 的 "Adults Only 18+" / "R18+" / "X18+" 都映射成整数 18）。
+    // 非限制级与判定不出时不写该字段，保持 Komga 原值。
+    const ADULT_AGE_RATING = 18;
+
+    // 书籍页刮削时，这些「系列级」字段要改写到所属系列：Komga 的书籍元数据没有这些字段
+    // （只有 SeriesMetadata 有 title / titleSort / ageRating），直接发给书籍 PATCH 会被 Komga 400 拒绝
+    const SERIES_SCOPED_FIELD_KEYS = {
+        __seriesTitle: 'title',
+        __seriesTitleSort: 'titleSort',
+        __seriesAgeRating: 'ageRating'
+    };
 
     // 駿河屋（兜底源）：只取搜索列表页，不抓商品详情页
     // （/product/detail/* 有 Cloudflare 拦截，实测直连返回 403「Just a moment...」；
@@ -2143,6 +2156,7 @@
             let pageCount = '';
             let author = '';
             let publisher = '';
+            let ageRating = null;
             const tags = [];
             const infoKeysRaw = {};
             // 信息表里 dd 内的链接文本（FANZA 的「ジャンル」是一串 <a>，拼成整串文本没法切分）
@@ -2225,6 +2239,11 @@
                     const parts = (linked && linked.length > 0)
                         ? linked
                         : val.split(/[,，、\/]/).map(function(s) { return s.trim(); });
+                    // 年龄分级：FANZA 同人详情页把「成人向け / 全年齢向け」放在 ジャンル 里，两者互斥（实测）。
+                    // 只在检出「成人向け」时记为限制级；两个标记都没有说明数据缺失，此时不猜、不写分级。
+                    if (/ジャンル/i.test(k) && parts.indexOf('成人向け') !== -1) {
+                        ageRating = ADULT_AGE_RATING;
+                    }
                     parts.forEach(function(p) {
                         if (!p || p.length > 30) return;
                         if (FANZA_TAG_BLOCKLIST.indexOf(p) !== -1) return;
@@ -2256,6 +2275,7 @@
                     pageCount: pageCount,
                     author: author,
                     tags: tags,
+                    ageRating: ageRating,
                     image: imageMeta
                 });
             }
@@ -2276,6 +2296,7 @@
                 pages: pageCount,
                 authors: author ? [{ name: author, role: 'writer' }] : [],
                 publisher: publisher,
+                ageRating: ageRating,
                 tags: tags,
                 isbn: '',
                 url: url,
@@ -2302,6 +2323,12 @@
             newMetadata.publisher = fanzaPublisher;
         }
 
+        // 年龄分级：取值语义是「作品的年龄分级」，只在最终写系列时使用
+        // （系列页直接写系列，书籍页走 __seriesAgeRating 同步到所属系列）
+        if (fanzaData.ageRating) {
+            newMetadata.ageRating = fanzaData.ageRating;
+        }
+
         if (fanzaData.tags && fanzaData.tags.length > 0) {
             newMetadata.tags = fanzaData.tags;
         }
@@ -2319,6 +2346,11 @@
 
         newMetadata.title = fanzaData.title || metadata.title;
         newMetadata.summary = fanzaData.summary || metadata.summary;
+
+        // 见 mapFanzaToSeries：这里只透传，书籍本身没有 ageRating 字段
+        if (fanzaData.ageRating) {
+            newMetadata.ageRating = fanzaData.ageRating;
+        }
 
         if (fanzaData.releaseDate) {
             newMetadata.releaseDate = fanzaData.releaseDate;
@@ -2425,6 +2457,17 @@
             // 列表缩略图是 size=m，换成 size=l 拿更大的封面
             image = image.replace(/([?&]size=)m\b/, '$1l');
 
+            // 年龄分级：駿河屋 用分类标签 + r18.png 图标标注限制级商品
+            // （实测标签如「男性向18禁同人誌」「女性向けアダルト同人誌（BL含む）」「インディーズアダルトDVD」；
+            //   非限制级商品不带该图标，对照实测无 r18 标记）
+            const conditionTexts = [];
+            const conditionNodes = node.querySelectorAll('p.condition');
+            for (let c = 0; c < conditionNodes.length; c++) {
+                conditionTexts.push(String(conditionNodes[c].textContent || ''));
+            }
+            const isAdultProduct = !!node.querySelector('img[src*="r18"]')
+                || /18禁|アダルト/.test(conditionTexts.join(' '));
+
             results.push({
                 source: 'surugaya',
                 sourceLabel: '駿河屋',
@@ -2437,6 +2480,7 @@
                 image: image,
                 largeImage: image,
                 publisher: name.circle,
+                ageRating: isAdultProduct ? ADULT_AGE_RATING : null,
                 releaseDate: releaseDate,
                 airDate: releaseDate,
                 authors: name.authors.map(function(authorName) { return { name: authorName, role: 'writer' }; }),
@@ -2516,6 +2560,11 @@
             newMetadata.publisher = surugayaPublisher;
         }
 
+        // 见 mapFanzaToSeries：取值语义是「作品的年龄分级」，只在最终写系列时使用
+        if (surugayaData.ageRating) {
+            newMetadata.ageRating = surugayaData.ageRating;
+        }
+
         if (surugayaData.links && surugayaData.links.length > 0) {
             newMetadata.links = surugayaData.links;
         }
@@ -2529,6 +2578,11 @@
 
         newMetadata.title = surugayaData.title || metadata.title;
         newMetadata.summary = surugayaData.summary || metadata.summary;
+
+        // 见 mapFanzaToSeries：这里只透传，书籍本身没有 ageRating 字段
+        if (surugayaData.ageRating) {
+            newMetadata.ageRating = surugayaData.ageRating;
+        }
 
         if (surugayaData.releaseDate) {
             newMetadata.releaseDate = surugayaData.releaseDate;
@@ -3367,11 +3421,13 @@
             formatKomgaStatusLabel(detected) + '。勾选后将覆盖为脚本判定值，锁定状态保持不变。';
     }
 
-    function showMetadataPreview(scrapeResult, currentData, pageType, source, onConfirm) {
+    function showMetadataPreview(scrapeResult, currentData, pageType, source, onConfirm, seriesData) {
         closeAllModals();
 
         const config = getConfig();
         const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
+        // 书籍页：父系列的元数据 DTO（用于渲染「同步到系列」字段的锁定态；取不到时按未锁定处理）
+        const currentSeriesMetadata = seriesData && seriesData.metadata ? seriesData.metadata : {};
         // 以抓到的数据自身来源为准：FANZA 流程兜底命中时拿到的是駿河屋的数据
         const mapSource = (scrapeResult && scrapeResult.source) ? scrapeResult.source : source;
 
@@ -3392,6 +3448,10 @@
 
         function isFieldLocked(key) {
             return currentMetadata[key + 'Lock'] === true;
+        }
+
+        function isSeriesFieldLocked(key) {
+            return currentSeriesMetadata[key + 'Lock'] === true;
         }
 
         // 语言自动识别：仅系列页、且 Komga 系列当前 language 为空、且未被锁定时，
@@ -3429,6 +3489,10 @@
             if (publisherValue) {
                 fields.push({ key: 'publisher', label: '出版社', type: 'text', value: publisherValue, checked: !isFieldLocked('publisher'), locked: isFieldLocked('publisher') });
             }
+            // 分级（仅系列级字段）：FANZA/駿河屋 判定为限制级时写 18；判不出/非限制级时 mappedMetadata 里没有该字段
+            if (mappedMetadata.ageRating) {
+                fields.push({ key: 'ageRating', label: '分级 (18禁)', type: 'text', value: String(mappedMetadata.ageRating), checked: !isFieldLocked('ageRating'), locked: isFieldLocked('ageRating') });
+            }
             if (detectedLanguage) {
                 fields.push({ key: 'language', label: '语言 (按文件夹名识别)', type: 'text', value: detectedLanguage, checked: !isFieldLocked('language'), locked: isFieldLocked('language') });
             }
@@ -3447,6 +3511,19 @@
             fields.push({ key: 'numberSort', label: '排序序号', type: 'text', value: currentNumberSort, checked: !isFieldLocked('numberSort') && !!currentNumberSort, locked: isFieldLocked('numberSort') });
             fields.push({ key: 'releaseDate', label: '发布日期', type: 'text', value: mappedMetadata.releaseDate || '', checked: !isFieldLocked('releaseDate') && !!mappedMetadata.releaseDate, locked: isFieldLocked('releaseDate') });
             fields.push({ key: 'isbn', label: 'ISBN', type: 'text', value: mappedMetadata.isbn || '', checked: !isFieldLocked('isbn') && !!mappedMetadata.isbn, locked: isFieldLocked('isbn') });
+        }
+
+        // 书籍页同步到所属系列：Komga 只在系列级有 title / titleSort / ageRating。
+        // 仅 FANZA 流程（source === 'fanza'，含駿河屋兜底）且能确定所属系列时提供这些字段。
+        if (pageType === 'book' && source === 'fanza' && currentData && currentData.seriesId) {
+            const seriesTitleValue = String(mappedMetadata.title || '').trim();
+            if (seriesTitleValue) {
+                fields.push({ key: '__seriesTitle', label: '系列标题（同步到系列）', type: 'text', value: seriesTitleValue, checked: !isSeriesFieldLocked('title'), locked: isSeriesFieldLocked('title') });
+                fields.push({ key: '__seriesTitleSort', label: '系列排序标题（同步到系列）', type: 'text', value: seriesTitleValue, checked: !isSeriesFieldLocked('titleSort'), locked: isSeriesFieldLocked('titleSort') });
+            }
+            if (mappedMetadata.ageRating) {
+                fields.push({ key: '__seriesAgeRating', label: '系列分级 (18禁，同步到系列)', type: 'text', value: String(mappedMetadata.ageRating), checked: !isSeriesFieldLocked('ageRating'), locked: isSeriesFieldLocked('ageRating') });
+            }
         }
 
         const hasAuthors = mappedMetadata.authors && mappedMetadata.authors.length > 0;
@@ -4011,6 +4088,13 @@
                 } else {
                     detail = await fetchSubjectDetail(selectedResult.id);
                 }
+
+                // 书籍页需要父系列的元数据：把「系列标题 / 排序标题 / 分级」同步回所属系列时，
+                // 要用它渲染锁定态（取不到时按未锁定处理，不阻断刮削）
+                let seriesData = null;
+                if (pageType === 'book' && isFanza && currentData && currentData.seriesId) {
+                    seriesData = await fetchSeriesData(currentData.seriesId);
+                }
                 closeAllModals();
 
                 if (!detail) {
@@ -4020,8 +4104,8 @@
                             showError('未选择任何字段', '请至少勾选一个要更新的字段');
                             return;
                         }
-                        writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData);
-                    });
+                        writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData, seriesData);
+                    }, seriesData);
                     return;
                 }
 
@@ -4031,8 +4115,8 @@
                         return;
                     }
 
-                    writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData);
-                });
+                    writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData, seriesData);
+                }, seriesData);
             };
 
             // 「加载更多」只在 v0 首屏结果上提供：旧接口降级没有总数、也无法稳定分页
@@ -4062,20 +4146,50 @@
         }
     }
 
-    async function writeMetadataToKomga(pageType, pageId, metadata, updatedFields, currentData) {
+    async function writeMetadataToKomga(pageType, pageId, metadata, updatedFields, currentData, seriesData) {
         try {
             const config = getConfig();
 
             const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
+            // 书籍页要同步到所属系列的字段（见 SERIES_SCOPED_FIELD_KEYS）：单独收集，绝不并入书籍 PATCH
+            const currentSeriesMetadata = seriesData && seriesData.metadata ? seriesData.metadata : {};
+            const seriesId = (seriesData && seriesData.id) || (currentData && currentData.seriesId) || '';
+            const seriesPayload = {};
+            const seriesUpdated = [];
+            const seriesScalarKeys = [];
             const finalMetadata = {};
             const finalUpdated = [];
             const writtenScalarKeys = [];
-            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数', publisher: '出版社', language: '语言' };
+            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', author: '作者', authors: '作者', links: '来源链接', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数', publisher: '出版社', language: '语言', ageRating: '分级', __seriesTitle: '系列标题', __seriesTitleSort: '系列排序标题', __seriesAgeRating: '系列分级' };
 
             if (config.debug) console.log('[KomgaScraper] Raw metadata from UI:', JSON.stringify(metadata, null, 2));
 
             Object.keys(metadata).forEach(function(key) {
                 const value = metadata[key];
+
+                // 系列级字段（书籍页同步到所属系列）：先归一化再单独收集，不进入书籍 PATCH
+                // （Komga 的 BookMetadataUpdateDto 没有 title/titleSort/ageRating，混进去会让整个 PATCH 400）
+                if (Object.prototype.hasOwnProperty.call(SERIES_SCOPED_FIELD_KEYS, key)) {
+                    const targetKey = SERIES_SCOPED_FIELD_KEYS[key];
+                    let normalized = null;
+                    if (targetKey === 'ageRating') {
+                        const num = Number(value);
+                        if (Number.isInteger(num) && num >= 0 && num <= 99) normalized = num;
+                    } else {
+                        const text = value === null || value === undefined ? '' : String(value).trim();
+                        if (text) normalized = text;
+                    }
+                    if (normalized === null) {
+                        if (config.debug) console.log('[KomgaScraper] Skipping invalid series-scoped value:', key, value);
+                        return;
+                    }
+                    seriesPayload[targetKey] = normalized;
+                    seriesUpdated.push(fieldLabels[key] || key);
+                    if (!isArrayField(targetKey)) {
+                        seriesScalarKeys.push(targetKey);
+                    }
+                    return;
+                }
 
                 if (key === 'pages') return;
 
@@ -4208,6 +4322,21 @@
                     return;
                 }
 
+                // ageRating 只存在于系列元数据（SeriesMetadataUpdateDto.ageRating: Int）
+                if (key === 'ageRating') {
+                    if (value !== null && value !== undefined && value !== '') {
+                        const num = Number(value);
+                        if (Number.isInteger(num) && num >= 0 && num <= 99) {
+                            finalMetadata.ageRating = num;
+                            finalUpdated.push(fieldLabels.ageRating || 'ageRating');
+                            writtenScalarKeys.push('ageRating');
+                        } else if (config.debug) {
+                            console.log('[KomgaScraper] Skipping invalid ageRating value:', value);
+                        }
+                    }
+                    return;
+                }
+
                 if (key === 'number' || key === 'numberSort') {
                     const text = value === null || value === undefined ? '' : String(value).trim();
                     if (!text) {
@@ -4275,20 +4404,57 @@
                 }
             });
 
-            if (Object.keys(finalMetadata).length === 0) {
+            if (Object.keys(seriesPayload).length > 0) {
+                // 系列级字段加锁：沿用同一语义，目标字段当前未锁才发 Lock（已锁定则只更新值、保持锁定）
+                seriesScalarKeys.forEach(function(key) {
+                    if (currentSeriesMetadata[key + 'Lock'] !== true) {
+                        seriesPayload[key + 'Lock'] = true;
+                    }
+                });
+            }
+
+            if (Object.keys(finalMetadata).length === 0 && Object.keys(seriesPayload).length === 0) {
                 showError('无可用字段', '所有勾选的字段都包含无效值，无法写入');
                 return;
             }
 
-            if (config.debug) console.log('[KomgaScraper] Writing metadata to Komga:', JSON.stringify(finalMetadata, null, 2));
+            if (config.debug) {
+                console.log('[KomgaScraper] Writing metadata to Komga:', JSON.stringify(finalMetadata, null, 2));
+                if (Object.keys(seriesPayload).length > 0) {
+                    console.log('[KomgaScraper] Writing series metadata to Komga:', seriesId, JSON.stringify(seriesPayload, null, 2));
+                }
+            }
 
             showLoading('正在写入元数据到 Komga...');
 
-            let success;
-            if (pageType === 'series') {
-                success = await updateSeriesMetadata(pageId, finalMetadata);
-            } else {
-                success = await updateBookMetadata(pageId, finalMetadata);
+            let success = true;
+            let failureDetail = '';
+
+            if (Object.keys(finalMetadata).length > 0) {
+                if (pageType === 'series') {
+                    success = await updateSeriesMetadata(pageId, finalMetadata);
+                } else {
+                    success = await updateBookMetadata(pageId, finalMetadata);
+                }
+                if (!success) {
+                    failureDetail = pageType === 'series' ? '系列元数据写入失败' : '书籍元数据写入失败';
+                }
+            }
+
+            // 书籍页：把系列级字段同步到所属系列（Komga 只在系列级有 title / titleSort / ageRating）
+            if (success && Object.keys(seriesPayload).length > 0) {
+                if (!seriesId) {
+                    success = false;
+                    failureDetail = '无法确定所属系列，系列标题 / 系列分级未同步';
+                } else {
+                    const seriesOk = await updateSeriesMetadata(seriesId, seriesPayload);
+                    if (seriesOk) {
+                        seriesUpdated.forEach(function(label) { finalUpdated.push(label); });
+                    } else {
+                        success = false;
+                        failureDetail = '书籍已更新，但所属系列元数据写入失败';
+                    }
+                }
             }
 
             if (success) {
@@ -4297,7 +4463,7 @@
                     window.location.reload();
                 });
             } else {
-                showError('写入元数据失败', '请检查 API Key 或页面权限设置');
+                showError('写入元数据失败', failureDetail || '请检查 API Key 或页面权限设置');
             }
 
         } catch (e) {
