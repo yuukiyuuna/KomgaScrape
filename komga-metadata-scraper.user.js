@@ -10,6 +10,7 @@
 // @grant        GM_getValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
+// @grant        GM_cookie
 // @connect      *
 // @connect      api.bgm.tv
 // @connect      www.dmm.co.jp
@@ -1931,63 +1932,81 @@
         return Object.assign({}, EXTERNAL_HTML_HEADERS, { 'Cookie': 'age_check_done=1' });
     }
 
+    /** 是否读得到浏览器 Cookie 罐（Tampermonkey 且已授予 GM_cookie 权限） */
+    function canReadBrowserCookies() {
+        return typeof GM_cookie !== 'undefined' && !!GM_cookie && typeof GM_cookie.list === 'function';
+    }
+
+    /** 当前脚本管理器名称（Tampermonkey / Violentmonkey / ...），取不到时返回空串 */
+    function getScriptHandler() {
+        try {
+            return (typeof GM_info !== 'undefined' && GM_info && GM_info.scriptHandler) ? String(GM_info.scriptHandler) : '';
+        } catch (e) {
+            return '';
+        }
+    }
+
+    /** 读取浏览器里 駿河屋 域的 Cookie（依赖 Tampermonkey 的 GM_cookie；不支持时返回空数组） */
+    function listSurugayaJarCookies() {
+        return new Promise(function(resolve) {
+            if (!canReadBrowserCookies()) {
+                resolve([]);
+                return;
+            }
+            try {
+                GM_cookie.list({}, function(cookies, error) {
+                    if (error || !cookies) {
+                        resolve([]);
+                        return;
+                    }
+                    resolve(cookies.filter(function(cookie) {
+                        return cookie && typeof cookie.domain === 'string' && /(^|\.)suruga-ya\.jp$/i.test(cookie.domain);
+                    }));
+                });
+            } catch (e) {
+                resolve([]);
+            }
+        });
+    }
+
     /**
-     * 駿河屋 请求头。
-     *  · 不写死 User-Agent：Cloudflare 的 cf_clearance 与浏览器 UA 绑定，换了 UA 会让已通过的校验失效；
-     *  · useJarCookies=true 时**不显式设 Cookie**，改由浏览器 Cookie 罐携带（含 cf_clearance 与 safe_search），
-     *    这是脚本复用「你在浏览器里已通过的人机校验」的唯一途径（显式 Cookie 头会顶掉整罐 Cookie）；
-     *  · useJarCookies=false 时显式带 safe_search —— 不带的话 18 禁条目的标题与链接会被服务端抹成空串。
+     * 构造 駿河屋 请求用的 Cookie 头。
+     * 除了必需的 safe_search（不带的话 18 禁条目的标题与链接会被服务端抹成空串），
+     * 还要带上浏览器里已通过 Cloudflare 人机校验的 Cookie（cf_clearance 等），
+     * 否则脚本发出的请求会被 Cloudflare 当成新访客、每次都要求重新校验。
+     *
+     * 返回 { cookie, mergedFromJar }：
+     *   mergedFromJar=true  → 已把浏览器 Cookie 显式拼进 cookie（含 cf_clearance）；
+     *   mergedFromJar=false → 读不到浏览器 Cookie（非 Tampermonkey / 未授予 GM_cookie），
+     *                          调用方会退回旧行为，只带 safe_search。
      */
-    function surugayaHeaders(useJarCookies) {
+    async function buildSurugayaCookie() {
+        const jar = await listSurugayaJarCookies();
+        const merged = {};
+        jar.forEach(function(cookie) { merged[cookie.name] = cookie.value; });
+        const mergedFromJar = Object.keys(merged).length > 0;
+        SURUGAYA_COOKIE.split(';').forEach(function(pair) {
+            const idx = pair.indexOf('=');
+            if (idx > 0) merged[pair.slice(0, idx).trim()] = pair.slice(idx + 1).trim();
+        });
+        const cookie = Object.keys(merged).map(function(name) { return name + '=' + merged[name]; }).join('; ');
+        return { cookie: cookie, mergedFromJar: mergedFromJar };
+    }
+
+    /** 駿河屋 请求参数：合并浏览器 Cookie 罐 + 必需 Cookie，并且不覆盖浏览器真实 UA */
+    async function surugayaRequestOptions() {
+        const info = await buildSurugayaCookie();
         const headers = Object.assign({}, EXTERNAL_HTML_HEADERS);
         delete headers['User-Agent'];
-        if (!useJarCookies) {
-            headers['Cookie'] = SURUGAYA_COOKIE;
+        if (info.mergedFromJar) {
+            // 读到浏览器 Cookie（含 cf_clearance）时显式整串带上、匿名发送（与 FANZA 同款做法）：
+            // 匿名 + 显式头可以避免和 Cookie 罐里的同名 Cookie 重复（罐里的 safe_search 旧值可能覆盖我们的 =3）
+            headers['Cookie'] = info.cookie;
+            return { headers: headers, anonymous: true };
         }
-        return headers;
-    }
-
-    /** 取一次駿河屋 搜索页 HTML；被 Cloudflare 拦下时抛出带 surugayaBlocked 标记的错误 */
-    async function fetchSurugayaSearchHtml(url, useJarCookies, debug) {
-        const response = await fetchWithRateLimit({
-            method: 'GET',
-            url: url,
-            headers: surugayaHeaders(useJarCookies),
-            anonymous: !useJarCookies,
-            useBrowserUserAgent: true
-        });
-
-        if (debug) console.log('[KomgaScraper] [Suruga-ya] Response status:', response.status, '/ 用浏览器 Cookie 罐:', useJarCookies);
-
-        if (response.status !== 200 || !response.raw) {
-            throw buildSurugayaBlockedError(
-                response.status === 403 ? 'cloudflare' : 'http',
-                '駿河屋 请求失败（HTTP ' + response.status + '）'
-            );
-        }
-
-        // Cloudflare 校验页同样是 200，标题固定是 Just a moment...
-        if (/<title[^>]*>\s*Just a moment/i.test(response.raw)) {
-            throw buildSurugayaBlockedError('cloudflare');
-        }
-
-        return response.raw;
-    }
-
-    /**
-     * 结果页里是否存在「标题被服务端抹空」的商品节点。
-     * 駿河屋 在请求没带 safe_search_option=3 时会把 18 禁条目的标题与链接抹成空串，
-     * 这些条目会被 parseSurugayaSearchItems 直接跳过 —— 用这个特征判断要不要退回显式 Cookie 重试。
-     */
-    function hasBlankSurugayaItemTitle(html) {
-        const doc = parseHtmlToDoc(html);
-        if (!doc) return false;
-        const nodes = doc.querySelectorAll('div.item');
-        for (let i = 0; i < nodes.length; i++) {
-            const nameNode = nodes[i].querySelector('h3.product-name');
-            if (nameNode && !String(nameNode.textContent || '').trim()) return true;
-        }
-        return false;
+        // 读不到浏览器 Cookie（非 Tampermonkey 或未授予 GM_cookie）：退回旧行为，只显式带 safe_search
+        headers['Cookie'] = SURUGAYA_COOKIE;
+        return { headers: headers, anonymous: true };
     }
 
     /** 实测 limit 未生效（每页固定 120 条），这里仅收敛成 30/60/120 以备 DMM 恢复该参数 */
@@ -2560,10 +2579,16 @@
 
     function describeSurugayaBlocked(reason) {
         if (reason === 'cloudflare') {
-            return '駿河屋 触发了 Cloudflare 人机校验（HTTP 403 / Just a moment）。'
+            let message = '駿河屋 触发了 Cloudflare 人机校验（HTTP 403 / Just a moment）。'
                 + '脚本会复用你浏览器里已通过的校验 Cookie（cf_clearance），它与「浏览器 User-Agent + 出口 IP」绑定，'
                 + '所以请在本脚本所在的那个浏览器里新开标签访问一次 https://www.suruga-ya.jp/search?search_word=test&adult_s=3 通过校验后立刻重试；'
                 + '若仍失败，通常是代理 / VPN 让出口 IP 变化导致校验 Cookie 失效，请关闭代理后直连重试。';
+            if (!canReadBrowserCookies()) {
+                message += /tampermonkey/i.test(getScriptHandler())
+                    ? '（当前脚本读不到浏览器 Cookie：需要 Tampermonkey 的 GM_cookie 权限，请在脚本管理器中更新本脚本并允许新增权限后重试。）'
+                    : '（当前脚本管理器不支持读取浏览器 Cookie（需要 Tampermonkey 的 GM_cookie 权限），因此无法复用校验 Cookie。）';
+            }
+            return message;
         }
         if (reason === 'parse') return '駿河屋 结果页结构可能已变更（未解析到任何商品）';
         return '请检查网络连接后重试';
@@ -2577,23 +2602,34 @@
         const searchUrl = SURUGAYA_SEARCH_URL.replace('{keyword}', encodeURIComponent(keyword));
         if (debug) console.log('[KomgaScraper] [Suruga-ya] Searching for:', keyword, '/ url:', searchUrl);
 
-        // 第一段：anonymous:false → 浏览器会把自己 Cookie 罐里的 Cookie 一起发出去
-        // （含 Cloudflare 校验 Cookie cf_clearance），只有这样才能复用你在浏览器里已通过的人机校验。
-        let html = await fetchSurugayaSearchHtml(searchUrl, true, debug);
-        let items = parseSurugayaSearchItems(html);
+        // 带上浏览器 Cookie 罐里的 Cloudflare 校验 Cookie，并沿用浏览器真实 UA（见 surugayaRequestOptions）
+        const surugayaOptions = await surugayaRequestOptions();
 
-        // 第二段：Cookie 罐里若没有 safe_search_option=3，18 禁条目的标题与链接会被服务端抹成空串，
-        // 这些条目会被解析器跳过；此时退回「显式带 safe_search」的旧做法（不含校验 Cookie）再取一次。
-        if (items !== null && hasBlankSurugayaItemTitle(html)) {
-            if (debug) console.log('[KomgaScraper] [Suruga-ya] 结果页有标题被抹空的条目（缺 safe_search Cookie），改用显式 Cookie 重试');
-            const retryHtml = await fetchSurugayaSearchHtml(searchUrl, false, debug);
-            const retryItems = parseSurugayaSearchItems(retryHtml);
-            if (retryItems !== null && retryItems.length > items.length) {
-                html = retryHtml;
-                items = retryItems;
-            }
+        const response = await fetchWithRateLimit({
+            method: 'GET',
+            url: searchUrl,
+            headers: surugayaOptions.headers,
+            useBrowserUserAgent: true,
+            anonymous: surugayaOptions.anonymous
+        });
+
+        if (debug) console.log('[KomgaScraper] [Suruga-ya] Response status:', response.status);
+
+        if (response.status !== 200 || !response.raw) {
+            throw buildSurugayaBlockedError(
+                response.status === 403 ? 'cloudflare' : 'http',
+                '駿河屋 请求失败（HTTP ' + response.status + '）'
+            );
         }
 
+        const html = response.raw;
+
+        // Cloudflare 校验页同样是 200，标题固定是 Just a moment...
+        if (/<title[^>]*>\s*Just a moment/i.test(html)) {
+            throw buildSurugayaBlockedError('cloudflare');
+        }
+
+        const items = parseSurugayaSearchItems(html);
         if (items === null) throw buildSurugayaBlockedError('parse');
 
         const total = extractSurugayaSearchTotal(html);
