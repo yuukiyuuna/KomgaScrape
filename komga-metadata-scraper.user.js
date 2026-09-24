@@ -3,8 +3,7 @@
 // @namespace    https://github.com/yourname/komga-scraper
 // @version      1.2.11
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削（FANZA 无结果时自动回退 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
-// @author       You
-// @match        {你自己的komga网站地址}
+// @author       Hancl
 // @match        https://www.suruga-ya.jp/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
