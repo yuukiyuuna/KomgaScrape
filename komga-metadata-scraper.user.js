@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.11
+// @version      1.2.12
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削（FANZA 无结果时自动回退 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
@@ -2026,6 +2026,110 @@
         return found;
     }
 
+    // ---------------- 非数字分卷标记（上 / 中 / 下） ----------------
+
+    // 写法不同的同义标记归一到同一个 token：Komga 侧写「上」、Bangumi 侧写「前編」也能配上。
+    const ORDINAL_VOLUME_MARKERS = [
+        { token: '上', words: ['前編', '前篇', '上巻', '上卷', '上'] },
+        { token: '中', words: ['中編', '中篇', '中巻', '中卷', '中'] },
+        { token: '下', words: ['後編', '後篇', '下巻', '下卷', '下'] }
+    ];
+    // 自带 巻/編/篇 后缀的写法粘在书名后面也认（「作品名前編」）；
+    // 光秃秃的「作品名上」不认，否则「坂道の上」这类标题会被误当卷标。
+    const ORDINAL_MARKER_STRONG_WORDS = ['前編', '前篇', '上巻', '上卷', '中編', '中篇', '中巻', '中卷', '後編', '後篇', '下巻', '下卷'];
+    // token -> 排序序号（上下两卷时 下=3，与 1 的相对顺序仍然正确）
+    const ORDINAL_VOLUME_RANK = { '上': 1, '中': 2, '下': 3 };
+    // 片段分隔符：标记必须是独立片段（「作品名 上」）或带后缀（「作品名上巻」），不在长词里截字
+    const VOLUME_SEGMENT_SPLIT_PATTERN = /[\s_\-–—+&・･、,，;；:：\/／\\|｜~～()（）\[\]【】{}｛｝<>《》「」『』"'"']+/;
+
+    // 汉字数字卷标（一巻 / 三冊 这类）-> 1–10；「十二巻」这类多位写法不处理，直接返回 null
+    const KANJI_DIGIT_VALUES = { '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9, '十': 10 };
+    const KANJI_VOLUME_PATTERN = /(?:^|[^一二三四五六七八九十])([一二三四五六七八九十])[巻卷冊册]$/;
+
+    /** 汉字数字卷标 -> 数字；命中不了返回 null（只认独立片段或以 巻・冊 结尾的写法） */
+    function parseKanjiVolumeNumber(text) {
+        const segments = toHalfWidthDigits(String(text == null ? '' : text)).trim().split(VOLUME_SEGMENT_SPLIT_PATTERN);
+        for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i].trim();
+            if (!seg) continue;
+            const m = seg.match(KANJI_VOLUME_PATTERN);
+            if (m && Object.prototype.hasOwnProperty.call(KANJI_DIGIT_VALUES, m[1])) return KANJI_DIGIT_VALUES[m[1]];
+        }
+        return null;
+    }
+
+    /**
+     * 文本里的非数字分卷标记 -> 归一化 token（「上」/「中」/「下」），认不出返回 null。
+     * 只认两种写法：
+     *   ① 独立片段：「作品名 上」「作品名(上)」「作品名・下」
+     *   ② 带 巻/編/篇 后缀的写法：「作品名 上巻」「作品名前編」
+     * 「上野さんは不器用」「下北沢」「坂道の上」都不算。
+     */
+    function parseOrdinalVolumeMarker(text) {
+        const raw = toHalfWidthDigits(String(text == null ? '' : text)).trim();
+        if (!raw) return null;
+        const segments = raw.split(VOLUME_SEGMENT_SPLIT_PATTERN);
+        for (let i = 0; i < segments.length; i++) {
+            const seg = segments[i].trim();
+            if (!seg) continue;
+            for (let g = 0; g < ORDINAL_VOLUME_MARKERS.length; g++) {
+                const group = ORDINAL_VOLUME_MARKERS[g];
+                for (let w = 0; w < group.words.length; w++) {
+                    const word = group.words[w];
+                    if (seg === word) return group.token;
+                    if (ORDINAL_MARKER_STRONG_WORDS.indexOf(word) !== -1 &&
+                        seg.length > word.length && seg.slice(-word.length) === word) {
+                        return group.token;
+                    }
+                }
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 「数字部分 + 非数字分卷标记」拼成匹配键：
+     *   3 + 上 -> '3上'；只有数字 -> 3（保持数字类型，现有匹配语义不变）；只有标记 -> '上'。
+     * Komga 文件名与 Bangumi 标题共用同一套规则，因此键可以直接比较。
+     */
+    function buildVolumeKey(numeric, marker) {
+        const hasNumeric = numeric !== null && numeric !== undefined && Number.isFinite(Number(numeric));
+        if (hasNumeric && marker) return String(numeric) + marker;
+        if (hasNumeric) return numeric;
+        return marker || null;
+    }
+
+    /**
+     * 文本 -> 卷号键（Komga 文件名 / Bangumi 标题共用）。
+     * 数字部分：显式卷标优先，其次汉字数字卷标，最后独立数字（digitPick='first' 取首个 / 'last' 取最后一个）；
+     * 非数字分卷标记只作为附加维度拼在数字后面，这样「1上」「1下」不会撞成同一个键。
+     */
+    function buildVolumeKeyFromText(text, digitPick) {
+        const normalized = String(text == null ? '' : text);
+        if (!normalized.trim()) return null;
+
+        let numeric = parseExplicitVolumeNumber(normalized);
+        if (numeric == null) numeric = parseKanjiVolumeNumber(normalized);
+        if (numeric == null) {
+            const found = findStandaloneVolumeCandidates(normalized);
+            if (found.length > 0) numeric = digitPick === 'last' ? found[found.length - 1] : found[0];
+        }
+        return buildVolumeKey(numeric, parseOrdinalVolumeMarker(normalized));
+    }
+
+    /** 卷号键 -> 排序序号（numberSort）：数字卷号取数字，'上'/'中'/'下' 取 1/2/3，'3上' 取 3；取不到返回 null */
+    function volumeSortValue(volume) {
+        if (volume === null || volume === undefined) return null;
+        const text = String(volume).trim();
+        if (!text) return null;
+        const direct = Number(text);
+        if (Number.isFinite(direct)) return direct;
+        const composite = text.match(/^([0-9]+(?:\.[0-9]+)?)([上中下])$/);
+        if (composite && Number.isFinite(Number(composite[1]))) return Number(composite[1]);
+        if (Object.prototype.hasOwnProperty.call(ORDINAL_VOLUME_RANK, text)) return ORDINAL_VOLUME_RANK[text];
+        return null;
+    }
+
     /** 取 Komga BookDto.url 中的文件名（受限用户只会看到文件名，取到什么用什么） */
     function fileNameFromUrl(url) {
         const text = String(url == null ? '' : url).replace(/[\\/]+$/, '');
@@ -2039,26 +2143,22 @@
     }
 
     /**
-     * 从 Komga 书籍的文件名（不含扩展名）解析卷号。
+     * 从 Komga 书籍的文件名（不含扩展名）解析卷号键。
      * 1) 显式卷标：第N巻 / N巻 / 第N話 / Vol.N / #N / N冊
-     * 2) 兜底：文件名中最后一个 1–3 位独立数字（如「Series 10」；四位年份不会被算进来）
+     * 2) 汉字数字卷标：一巻 / 三冊
+     * 3) 非数字分卷标记：上 / 中 / 下 / 前編 / 後編 / 上巻（可以带上数字，如 '3上'）
+     * 4) 兜底：文件名中最后一个 1–3 位独立数字（如「Series 10」；四位年份不会被算进来）
      * 解析不到返回 null，由调用方回退 Komga 已有的 metadata.number。
      */
     function extractVolumeNumberFromFileName(fileName) {
         const raw = String(fileName == null ? '' : fileName).trim();
         if (!raw) return null;
-        const base = raw.replace(FILE_EXTENSION_PATTERN, '');
-
-        const explicit = parseExplicitVolumeNumber(base);
-        if (explicit != null) return explicit;
-
         // 文件名里的数字几乎总在卷号位置靠后（前面可能有年份、期刊号等），取最后一个
-        const candidates = findStandaloneVolumeCandidates(base);
-        return candidates.length > 0 ? candidates[candidates.length - 1] : null;
+        return buildVolumeKeyFromText(raw.replace(FILE_EXTENSION_PATTERN, ''), 'last');
     }
 
     /**
-     * Bangumi 条目标题 -> 卷号：显式卷标优先，其次退化为标题中首个 1–3 位独立数字。
+     * Bangumi 条目标题 -> 卷号键：与文件名解析同一套规则，只是独立数字取标题中的首个。
      */
     function normalizeVolumeNumber(name, nameCn) {
         if (!name && !nameCn) return null;
@@ -2066,10 +2166,8 @@
         for (let i = 0; i < candidates.length; i++) {
             const text = String(candidates[i] || '');
             if (!text) continue;
-            const explicit = parseExplicitVolumeNumber(text);
-            if (explicit != null) return explicit;
-            const found = findStandaloneVolumeCandidates(text);
-            if (found.length > 0) return found[0];
+            const key = buildVolumeKeyFromText(text, 'first');
+            if (key != null) return key;
         }
         return null;
     }
@@ -3828,8 +3926,10 @@
             const metadataNumber = currentMetadata.number != null ? String(currentMetadata.number).trim() : '';
             const parsedVolume = extractVolumeNumberFromFileName(currentData && (currentData.name || fileNameFromUrl(currentData.url)));
             const currentNumber = parsedVolume != null ? String(parsedVolume) : metadataNumber;
-            const currentNumberSort = parsedVolume != null
-                ? String(parsedVolume)
+            // 非数字分卷（'上' / '下'）直接填进 numberSort 会被 Komga 校验挡掉，这里换成排序值 1/2/3
+            const parsedSortValue = parsedVolume != null ? volumeSortValue(parsedVolume) : null;
+            const currentNumberSort = parsedSortValue != null
+                ? String(parsedSortValue)
                 : (currentMetadata.numberSort != null && currentMetadata.numberSort !== '' ? String(currentMetadata.numberSort) : metadataNumber);
             fields.push({ key: 'number', label: '序号', type: 'text', value: currentNumber, checked: !isFieldLocked('number') && !!currentNumber, locked: isFieldLocked('number') });
             fields.push({ key: 'numberSort', label: '排序序号', type: 'text', value: currentNumberSort, checked: !isFieldLocked('numberSort') && !!currentNumberSort, locked: isFieldLocked('numberSort') });
@@ -4832,12 +4932,14 @@
             if (!map[key]) map[key] = b;
         }
 
-        // 统计 Komga 侧的重复卷号（仅用于确认弹窗提示，不改变匹配结果）
-        const keyCounts = {};
+        // 统计 Komga 侧的重复卷号（只用于确认弹窗提示，不改变匹配结果）：
+        // 记下同键的书都是哪几本，弹窗里才能写明「与哪一本重复」。
+        const keyOwners = {};
         for (let k = 0; k < komgaBooks.length; k++) {
             const key = normalizeVolumeKey(komgaBooks[k].volumeNumber);
             if (key == null) continue;
-            keyCounts[key] = (keyCounts[key] || 0) + 1;
+            if (!keyOwners[key]) keyOwners[key] = [];
+            keyOwners[key].push(komgaBooks[k]);
         }
 
         const result = [];
@@ -4845,11 +4947,20 @@
             const kb = komgaBooks[j];
             const key = normalizeVolumeKey(kb.volumeNumber);
             const matched = key != null ? map[key] : null;
+            const owners = key != null && keyOwners[key] ? keyOwners[key] : [];
             result.push({
                 komgaBook: kb,
                 bangumiBook: matched || null,
-                reason: matched ? null : (key == null ? '未识别卷号' : 'Bangumi 无该卷号'),
-                duplicate: key != null && keyCounts[key] > 1
+                key: key,
+                reason: matched
+                    ? null
+                    : (key == null
+                        ? '未识别卷号（可能是特典 / 画集）'
+                        : 'Bangumi 无该卷号（缺卷或命名不符）'),
+                duplicate: owners.length > 1,
+                duplicateWith: owners.length > 1
+                    ? owners.filter(function(o) { return o !== kb; })
+                    : []
             });
         }
         return result;
@@ -4863,9 +4974,12 @@
             // 卷号：只信任从文件名解析出来的值，并写回 Komga 修正被按位置重编号的序号
             // （旧实现直接沿用 BookDto.number —— 那只是位置序号，会写回错误的序号并加锁）。
             // 文件名解析不出卷号、只能靠 metadata.number 兜底匹配的书，不写这两个字段。
+            // 卷号可能是非数字分卷键（'上' / '下' / '3上'）：number 照写字符串值，
+            // numberSort 取 volumeSortValue（上/中/下 -> 1/2/3），Komga 侧排序才不会乱。
             if (komgaBook && komgaBook.volumeSource === 'filename' && komgaBook.volumeNumber != null) {
                 mapped.number = String(komgaBook.volumeNumber);
-                mapped.numberSort = Number(komgaBook.volumeNumber);
+                const volumeSort = volumeSortValue(komgaBook.volumeNumber);
+                if (volumeSort != null) mapped.numberSort = volumeSort;
             }
 
             // links 字段：确保写入当前 Bangumi subject 的链接
@@ -4932,159 +5046,420 @@
 
     /**
      * 自动刮削确认弹窗。
-     * 除了计数，还逐本列出「解析卷号 / Komga 文件名 / 匹配到的 Bangumi 条目」，
-     * 便于在写入前发现错配（未识别卷号、卷号重复、覆盖已锁定序号等）。
+     * 逐本列出「卷号 / 文件名 → 匹配到的 Bangumi 条目」，未匹配的书可以在弹窗里
+     * 手动指定该系列下的 Bangumi 子条目（手动指定只作用于本次刮削，不写回 Komga 元数据）。
+     * 另有「按顺序配对」：先给预览，确认后才落到表格里。
      */
-    function showAutoScrapeConfirm(seriesTitle, pairs, onConfirm) {
+    function showAutoScrapeConfirm(seriesTitle, pairs, candidates, onConfirm) {
         closeAllModals();
-        const title = String(seriesTitle || '该系列');
+        const seriesName = String(seriesTitle || '该系列');
         const list = Array.isArray(pairs) ? pairs : [];
+        const candidateList = Array.isArray(candidates) ? candidates : [];
+
+        // 勾选与手动配对的状态都记在 pairs 上（DOM 只负责展示，重渲染后不丢）
+        list.forEach(function(p) {
+            if (!p) return;
+            p.bangumiBook = p.bangumiBook || null;
+            p.manual = false;
+            p.selected = !!p.bangumiBook;
+        });
+
+        let openPickerIndex = -1;        // 当前展开候选面板的行；-1 表示没展开
+        let orderPreview = null;         // 非 null 时显示「按顺序配对」预览视图
+        let orderIncludeUnknown = false; // 顺序配对是否也纳入「未识别卷号」的书
+        let noticeText = '';
         const totalBooks = list.length;
-        const matchedBooks = list.filter(function(p) { return p && p.bangumiBook; }).length;
 
-        const rowsHtml = list.map(function(p, idx) {
+        function bookLabel(kb) {
+            return String((kb && (kb.name || fileNameFromUrl(kb.url))) || '(未命名)');
+        }
+
+        function candidateLabel(c) {
+            const name = String((c && c.name) || '');
+            const nameCn = String((c && c.nameCn) || '');
+            if (nameCn && nameCn !== name) return name + '（' + nameCn + '）';
+            return name || nameCn || ('id ' + String((c && c.id) || ''));
+        }
+
+        /** 候选是否已被别的行占用（1:1，避免两本书写同一条目） */
+        function assignedOwner(candidateId, exceptIndex) {
+            for (let i = 0; i < list.length; i++) {
+                const p = list[i];
+                if (!p || i === exceptIndex) continue;
+                if (p.bangumiBook && String(p.bangumiBook.id) === String(candidateId)) return p;
+            }
+            return null;
+        }
+
+        function counts() {
+            let auto = 0, manual = 0, unmatched = 0, duplicateRows = 0, selected = 0;
+            list.forEach(function(p) {
+                if (!p) return;
+                if (p.bangumiBook) {
+                    if (p.manual) manual++; else auto++;
+                    if (p.selected) selected++;
+                } else {
+                    unmatched++;
+                }
+                if (p.duplicate) duplicateRows++;
+            });
+            return { auto: auto, manual: manual, unmatched: unmatched, duplicateRows: duplicateRows, selected: selected };
+        }
+
+        function hasVolumeKey(p) {
+            const kb = p && p.komgaBook;
+            return !!(kb && kb.volumeNumber != null && String(kb.volumeNumber).trim() !== '');
+        }
+
+        function volumeTextOf(p) {
+            return hasVolumeKey(p) ? String(p.komgaBook.volumeNumber) : '—';
+        }
+
+        // ---------------- 手动指定：候选面板 ----------------
+
+        function buildCandidatePanelHtml(idx) {
+            const rows = candidateList.map(function(c, ci) {
+                const owner = assignedOwner(c.id, idx);
+                const label = candidateLabel(c);
+                return '<div class="ks-as-cand" data-cand="' + String(ci) + '" data-index="' + String(idx) + '"' +
+                    (owner ? '' : ' data-selectable="1"') +
+                    ' style="padding:6px 8px;border-radius:8px;margin-bottom:6px;border:1px solid rgba(255,255,255,0.08);' +
+                    'background:rgba(255,255,255,0.05);cursor:' + (owner ? 'not-allowed' : 'pointer') + ';' + (owner ? 'opacity:0.45;' : '') + '">' +
+                    '<div style="display:flex;gap:6px;align-items:center;">' +
+                        '<span style="flex:0 0 auto;font-size:11px;color:#4fc3f7;border:1px solid rgba(79,195,247,0.4);border-radius:6px;padding:0 4px;">' + escapeHtmlText(String((c && c.relation) || '条目')) + '</span>' +
+                        '<span class="ks-truncate-text" data-full-text="' + escapeHtmlText(label) + '" style="flex:1 1 auto;min-width:0;color:rgba(255,255,255,0.85);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(label) + '</span>' +
+                    '</div>' +
+                    '<div style="font-size:11px;color:rgba(255,255,255,0.45);margin-top:2px;">' +
+                        (c && c.date ? escapeHtmlText(String(c.date)) + ' · ' : '') + 'id ' + escapeHtmlText(String((c && c.id) || '')) +
+                        (owner ? ' · 已分配给 ' + escapeHtmlText(bookLabel(owner.komgaBook)) : '') +
+                    '</div>' +
+                '</div>';
+            }).join('');
+
+            return '<div class="ks-as-panel" style="margin:4px 0 8px 24px;padding:8px;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:10px;">' +
+                '<div style="color:rgba(255,255,255,0.5);font-size:12px;margin-bottom:6px;">选择该系列下的 Bangumi 条目（已分配给其它书的不可选）</div>' +
+                (rows || '<div style="color:#ffb74d;font-size:12px;">该系列在 Bangumi 下没有可选的子条目</div>') +
+                '<div style="text-align:right;"><span class="ks-as-link" data-act="close-picker" data-index="' + String(idx) + '" style="color:rgba(255,255,255,0.6);font-size:12px;cursor:pointer;">收起</span></div>' +
+            '</div>';
+        }
+
+        // ---------------- 逐本列表 ----------------
+
+        function buildRowHtml(p, idx) {
             const kb = (p && p.komgaBook) || {};
-            const selectable = !!(p && p.bangumiBook);
-            const bookName = String(kb.name || fileNameFromUrl(kb.url) || '(未命名)');
-            const hasVolume = kb.volumeNumber != null && String(kb.volumeNumber).trim() !== '';
-            const volumeCell = escapeHtmlText(hasVolume ? String(kb.volumeNumber) : '—') +
-                (p && p.duplicate ? '<span style="color:#ffb74d;" title="多本书解析出同一卷号">⚠</span>' : '');
+            const bookName = bookLabel(kb);
+            const volumeText = volumeTextOf(p);
+            const volumeSourceTag = (hasVolumeKey(p) && kb.volumeSource === 'metadata')
+                ? '<div style="color:rgba(255,255,255,0.35);font-size:11px;">位置推断</div>'
+                : '';
+            const volumeCell =
+                '<div style="flex:0 0 88px;text-align:right;">' +
+                    '<div style="color:#4fc3f7;font-weight:600;">' + escapeHtmlText(volumeText) +
+                        (p && p.duplicate ? '<span style="color:#ffb74d;" title="与其它书解析出同一卷号">⚠</span>' : '') +
+                    '</div>' + volumeSourceTag +
+                '</div>';
 
-            // 逐本勾选：有匹配的默认勾选，未匹配的不可勾选（本来就没东西可写）
             const checkboxCell = '<input type="checkbox" class="ks-as-book-checkbox" data-index="' + String(idx) + '"' +
-                (selectable ? ' checked' : ' disabled') +
+                (p && p.bangumiBook ? (p.selected ? ' checked' : '') : ' disabled') +
                 ' style="flex:0 0 auto;width:16px;height:16px;accent-color:#667eea;' +
-                (selectable ? 'cursor:pointer;' : 'cursor:not-allowed;opacity:0.4;') + '">';
+                (p && p.bangumiBook ? 'cursor:pointer;' : 'cursor:not-allowed;opacity:0.4;') + '">';
 
             let rightCell;
-            let noteHtml = '';
+            let extraHtml = '';
             if (p && p.bangumiBook) {
-                const bangumiName = String(p.bangumiBook.name || '');
-                const bangumiNameCn = String(p.bangumiBook.nameCn || '');
-                const display = bangumiNameCn && bangumiNameCn !== bangumiName
-                    ? bangumiName + '（' + bangumiNameCn + '）'
-                    : (bangumiName || bangumiNameCn);
-                rightCell = '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(display) + '" style="flex:1 1 52%;min-width:0;color:rgba(255,255,255,0.85);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(display) + '</div>';
+                const badge = p.manual
+                    ? '<span style="flex:0 0 auto;font-size:11px;color:#ffb74d;border:1px solid rgba(255,183,77,0.45);border-radius:6px;padding:0 4px;">手动</span>'
+                    : '<span style="flex:0 0 auto;font-size:11px;color:#4caf50;border:1px solid rgba(76,175,80,0.45);border-radius:6px;padding:0 4px;">自动</span>';
+                const display = candidateLabel(p.bangumiBook);
+                rightCell = '<div style="flex:1 1 52%;min-width:0;">' +
+                    '<div style="display:flex;gap:6px;align-items:center;">' + badge +
+                        '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(display) + '" style="flex:1 1 auto;min-width:0;color:rgba(255,255,255,0.85);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(display) + '</div>' +
+                    '</div>' +
+                    (p.manual
+                        ? '<div style="font-size:12px;margin-top:2px;">' +
+                            '<span class="ks-as-link" data-act="pick" data-index="' + String(idx) + '" style="color:#4fc3f7;cursor:pointer;">换一个</span>' +
+                            ' · <span class="ks-as-link" data-act="unassign" data-index="' + String(idx) + '" style="color:rgba(255,255,255,0.6);cursor:pointer;">取消指定</span>' +
+                          '</div>'
+                        : '') +
+                '</div>';
                 if (kb.volumeSource === 'filename' && kb.numberLocked === true &&
                     kb.metadataNumber && kb.metadataNumber !== String(kb.volumeNumber)) {
-                    noteHtml = '<div style="color:#ffb74d;font-size:12px;margin-top:2px;">' +
+                    extraHtml += '<div style="color:#ffb74d;font-size:12px;margin-top:2px;">' +
                         'Komga 序号 ' + escapeHtmlText(kb.metadataNumber) + ' → ' + escapeHtmlText(String(kb.volumeNumber)) + '（已锁定，将被覆盖）' +
                     '</div>';
                 }
             } else {
-                rightCell = '<div style="flex:1 1 52%;min-width:0;color:#ffb74d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">未匹配：' +
-                    escapeHtmlText((p && p.reason) || '未匹配') + '（跳过）</div>';
+                rightCell = '<div style="flex:1 1 auto;min-width:0;color:#ffb74d;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">未匹配：' +
+                    escapeHtmlText((p && p.reason) || '未匹配') + '（跳过）</div>' +
+                    '<button class="ks-btn ks-btn-secondary ks-as-link" data-act="pick" data-index="' + String(idx) + '" style="flex:0 0 auto;font-size:12px;padding:4px 8px;">手动指定</button>';
+            }
+
+            if (p && p.duplicate) {
+                const other = (p.duplicateWith && p.duplicateWith[0]) ? bookLabel(p.duplicateWith[0]) : '另一本';
+                extraHtml += '<div style="color:#ffb74d;font-size:12px;margin-top:2px;">' +
+                    '⚠ 卷号「' + escapeHtmlText(volumeText) + '」与「' + escapeHtmlText(other) + '」重复；' +
+                    '本书卷号' + (kb.volumeSource === 'metadata' ? '由位置推断' : '由文件名解析') + '，请核对后再决定是否刮削' +
+                '</div>';
             }
 
             return '<div style="padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.06);">' +
                 '<div style="display:flex;gap:8px;align-items:center;">' +
-                    checkboxCell +
-                    '<div style="flex:0 0 46px;text-align:right;color:#4fc3f7;font-weight:600;">' + volumeCell + '</div>' +
+                    checkboxCell + volumeCell +
                     '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(bookName) + '" style="flex:1 1 48%;min-width:0;color:rgba(255,255,255,0.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(bookName) + '</div>' +
                     rightCell +
-                '</div>' + noteHtml +
+                '</div>' + extraHtml +
+                (openPickerIndex === idx ? buildCandidatePanelHtml(idx) : '') +
             '</div>';
-        }).join('');
+        }
 
-        const listHtml =
-            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">' +
-                '<label style="display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.7);font-size:12px;cursor:pointer;">' +
-                    '<input type="checkbox" id="ks-as-select-all"' + (matchedBooks > 0 ? ' checked' : ' disabled') +
-                    ' style="width:15px;height:15px;accent-color:#667eea;cursor:pointer;">全选' +
+        // ---------------- 按顺序配对（先预览再应用） ----------------
+
+        /**
+         * 未匹配的书按 Komga 列表顺序、与尚未占用的 Bangumi 条目按顺序配对。
+         * 默认只处理「已解析出卷号」的书：没解析出卷号的多半是特典 / 画集，硬配只会错位。
+         */
+        function planOrderPairing(includeUnknown) {
+            const used = {};
+            list.forEach(function(p) {
+                if (p && p.bangumiBook) used[String(p.bangumiBook.id)] = true;
+            });
+            const freeCandidates = candidateList.filter(function(c) { return !used[String(c.id)]; });
+            const targets = [];
+            for (let i = 0; i < list.length; i++) {
+                const p = list[i];
+                if (!p || p.bangumiBook) continue;
+                if (!hasVolumeKey(p) && !includeUnknown) continue;
+                targets.push({ index: i, pair: p });
+            }
+            const rows = [];
+            for (let k = 0; k < targets.length && k < freeCandidates.length; k++) {
+                rows.push({ index: targets[k].index, pair: targets[k].pair, candidate: freeCandidates[k] });
+            }
+            return { rows: rows, targetCount: targets.length, freeCount: freeCandidates.length };
+        }
+
+        function buildOrderPreviewHtml(plan) {
+            const warn = plan.targetCount === plan.freeCount
+                ? ''
+                : '<div style="color:#ffb74d;font-size:12px;margin-bottom:8px;">⚠ Komga 待配对 ' + String(plan.targetCount) +
+                  ' 本 / Bangumi 未占用 ' + String(plan.freeCount) + ' 条，数量不一致：顺序配对可能把卷号配错（缺卷或有多余特典时尤其危险），请逐行核对。</div>';
+            const rowsHtml = plan.rows.map(function(r) {
+                const left = bookLabel(r.pair.komgaBook);
+                const right = candidateLabel(r.candidate);
+                return '<div style="padding:6px 8px;border-bottom:1px solid rgba(255,255,255,0.06);display:flex;gap:8px;align-items:center;">' +
+                    '<div style="flex:0 0 56px;text-align:right;color:#4fc3f7;font-weight:600;">' + escapeHtmlText(volumeTextOf(r.pair)) + '</div>' +
+                    '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(left) + '" style="flex:1 1 48%;min-width:0;color:rgba(255,255,255,0.6);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(left) + '</div>' +
+                    '<div style="flex:0 0 auto;color:rgba(255,255,255,0.4);">→</div>' +
+                    '<div class="ks-truncate-text" data-full-text="' + escapeHtmlText(right) + '" style="flex:1 1 48%;min-width:0;color:rgba(255,255,255,0.85);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;">' + escapeHtmlText(right) + '</div>' +
+                '</div>';
+            }).join('');
+            const leftover = plan.targetCount - plan.rows.length;
+            return warn +
+                '<div style="color:rgba(255,255,255,0.4);font-size:12px;margin-bottom:6px;">卷号　文件名　→　将配对的 Bangumi 条目</div>' +
+                '<div id="ks-as-list" style="max-height:240px;overflow-y:auto;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:10px;">' +
+                    (rowsHtml || '<div style="padding:12px;color:#ffb74d;font-size:12px;">没有可配对的组合</div>') +
+                '</div>' +
+                (leftover > 0 ? '<div style="color:#ffb74d;font-size:12px;margin-top:6px;">还有 ' + String(leftover) + ' 本没有对应条目，将保持未匹配。</div>' : '') +
+                '<label style="display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.7);font-size:12px;margin-top:10px;cursor:pointer;">' +
+                    '<input type="checkbox" id="ks-as-order-include-unknown"' + (orderIncludeUnknown ? ' checked' : '') + ' style="width:15px;height:15px;accent-color:#667eea;">' +
+                    '同时为「未识别卷号」的书配对（多半是特典 / 画集，默认不参与）' +
                 '</label>' +
-                '<div style="color:rgba(255,255,255,0.4);font-size:12px;">卷号　文件名　→　Bangumi 条目</div>' +
-            '</div>' +
-            '<div id="ks-as-list" style="max-height:240px;overflow-y:auto;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:8px;margin-bottom:16px;">' +
-                (rowsHtml || '<div style="padding:12px;color:rgba(255,255,255,0.5);font-size:13px;text-align:center;">该系列下没有书籍</div>') +
-            '</div>';
+                '<div style="display:flex;gap:10px;justify-content:center;margin-top:16px;">' +
+                    '<button class="ks-btn ks-btn-secondary" id="ks-as-order-back">返回</button>' +
+                    '<button class="ks-btn ks-btn-primary" id="ks-as-order-apply"' + (plan.rows.length === 0 ? ' disabled' : '') + '>应用配对</button>' +
+                '</div>';
+        }
+
+        function applyOrderPairing() {
+            if (!orderPreview) return;
+            const applied = orderPreview.rows.length;
+            orderPreview.rows.forEach(function(r) {
+                r.pair.bangumiBook = r.candidate;
+                r.pair.manual = true;
+                r.pair.selected = true;
+            });
+            orderPreview = null;
+            openPickerIndex = -1;
+            noticeText = '已按顺序配对 ' + String(applied) + ' 本，请逐行核对后再开始。';
+            render();
+        }
+
+        // ---------------- 渲染 ----------------
+
+        function render() {
+            const bodyEl = modal.querySelector('#ks-as-body');
+            if (!bodyEl) return;
+
+            if (orderPreview) {
+                bodyEl.innerHTML = buildOrderPreviewHtml(orderPreview);
+                const listEl = bodyEl.querySelector('#ks-as-list');
+                if (listEl) bindTitleTooltipDelegates(listEl);
+                const includeCb = bodyEl.querySelector('#ks-as-order-include-unknown');
+                if (includeCb) {
+                    includeCb.onchange = function() {
+                        orderIncludeUnknown = includeCb.checked;
+                        orderPreview = planOrderPairing(orderIncludeUnknown);
+                        render();
+                    };
+                }
+                const backBtn = bodyEl.querySelector('#ks-as-order-back');
+                if (backBtn) backBtn.onclick = function() { orderPreview = null; render(); };
+                const applyBtn = bodyEl.querySelector('#ks-as-order-apply');
+                if (applyBtn) applyBtn.onclick = applyOrderPairing;
+                return;
+            }
+
+            const c = counts();
+            const summaryHtml =
+                '<div style="background:rgba(255,255,255,0.05);border-radius:10px;padding:12px;margin-bottom:12px;font-size:14px;line-height:1.8;color:rgba(255,255,255,0.8);">' +
+                    '系列：<span style="color:#fff;">' + escapeHtmlText(seriesName) + '</span><br/>' +
+                    '书籍总数：' + String(totalBooks) +
+                    '　|　自动匹配：<span style="color:#4caf50;">' + String(c.auto) + '</span>' +
+                    '　|　手动指定：<span style="color:#ffb74d;">' + String(c.manual) + '</span><br/>' +
+                    '无法匹配（跳过）：<span style="color:#ffb74d;">' + String(c.unmatched) + '</span>' +
+                    (c.duplicateRows > 0 ? '　|　重复卷号：<span style="color:#ffb74d;">' + String(c.duplicateRows) + ' 行 ⚠</span>' : '') + '<br/>' +
+                    '本次将刮削（已勾选）：<span id="ks-as-selected-count" style="color:#4caf50;">' + String(c.selected) + '</span> 本' +
+                '</div>';
+
+            const toolbarHtml =
+                '<div style="display:flex;align-items:center;gap:10px;margin-bottom:6px;">' +
+                    '<label style="display:flex;align-items:center;gap:6px;color:rgba(255,255,255,0.7);font-size:12px;cursor:pointer;">' +
+                        '<input type="checkbox" id="ks-as-select-all"' + (c.auto + c.manual > 0 ? ' checked' : ' disabled') +
+                        ' style="width:15px;height:15px;accent-color:#667eea;cursor:pointer;">全选' +
+                    '</label>' +
+                    '<div style="flex:1 1 auto;color:rgba(255,255,255,0.4);font-size:12px;">卷号　文件名　→　Bangumi 条目</div>' +
+                    (candidateList.length > 0
+                        ? '<button class="ks-btn ks-btn-secondary" id="ks-as-order-btn" style="flex:0 0 auto;font-size:12px;padding:5px 10px;">按顺序配对…</button>'
+                        : '') +
+                '</div>';
+
+            bodyEl.innerHTML =
+                (noticeText ? '<div style="color:#4fc3f7;font-size:12px;margin-bottom:8px;">' + escapeHtmlText(noticeText) + '</div>' : '') +
+                summaryHtml + toolbarHtml +
+                '<div id="ks-as-list" style="max-height:240px;overflow-y:auto;background:rgba(0,0,0,0.25);border:1px solid rgba(255,255,255,0.08);border-radius:10px;">' +
+                    list.map(buildRowHtml).join('') +
+                '</div>' +
+                '<div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-top:12px;line-height:1.6;">' +
+                    '逐本列表默认全选，可取消不想刮削的书；未匹配的书可「手动指定」连到该系列的 Bangumi 条目；' +
+                    '所有写入的字段会自动在 Komga 中加锁；文件名解析出卷号的书会把「序号 / 排序序号」修正为该卷号' +
+                    '（上 / 中 / 下 这类非数字分卷的排序值为 1 / 2 / 3）。' +
+                '</div>' +
+                '<div id="ks-as-empty-hint" style="' + (c.selected === 0 ? '' : 'display:none;') + 'color:#ffb74d;font-size:12px;text-align:center;margin-top:8px;">没有可刮削的书（全部未匹配或已取消勾选）</div>';
+
+            const listEl = bodyEl.querySelector('#ks-as-list');
+            const selectAllCb = bodyEl.querySelector('#ks-as-select-all');
+            const confirmBtn = modal.querySelector('#ks-as-confirm');
+
+            function refreshSelectionState() {
+                const now = counts();
+                const selectedCountEl = bodyEl.querySelector('#ks-as-selected-count');
+                if (selectedCountEl) selectedCountEl.textContent = String(now.selected);
+                const assignable = now.auto + now.manual;
+                if (selectAllCb) {
+                    selectAllCb.checked = assignable > 0 && now.selected === assignable;
+                    selectAllCb.indeterminate = now.selected > 0 && now.selected < assignable;
+                    selectAllCb.disabled = assignable === 0;
+                }
+                if (confirmBtn) {
+                    confirmBtn.disabled = now.selected === 0;
+                    confirmBtn.style.opacity = now.selected === 0 ? '0.5' : '';
+                    confirmBtn.style.cursor = now.selected === 0 ? 'not-allowed' : 'pointer';
+                }
+                const emptyHintEl = bodyEl.querySelector('#ks-as-empty-hint');
+                if (emptyHintEl) emptyHintEl.style.display = now.selected === 0 ? 'block' : 'none';
+            }
+
+            if (listEl) {
+                bindTitleTooltipDelegates(listEl);
+                listEl.addEventListener('click', function(e) {
+                    const el = e.target && e.target.closest ? e.target.closest('[data-act]') : null;
+                    if (!el) return;
+                    e.preventDefault();
+                    const act = el.getAttribute('data-act');
+                    const idx = parseInt(el.getAttribute('data-index'), 10);
+                    if (isNaN(idx) || !list[idx]) return;
+                    const p = list[idx];
+                    if (act === 'pick') {
+                        openPickerIndex = openPickerIndex === idx ? -1 : idx;
+                        render();
+                    } else if (act === 'close-picker') {
+                        openPickerIndex = -1;
+                        render();
+                    } else if (act === 'unassign') {
+                        p.bangumiBook = null;
+                        p.manual = false;
+                        p.selected = false;
+                        openPickerIndex = -1;
+                        noticeText = '';
+                        render();
+                    }
+                });
+            }
+
+            bodyEl.querySelectorAll('.ks-as-cand').forEach(function(candEl) {
+                if (!candEl.getAttribute('data-selectable')) return;
+                candEl.onclick = function() {
+                    const ci = parseInt(candEl.getAttribute('data-cand'), 10);
+                    const idx = parseInt(candEl.getAttribute('data-index'), 10);
+                    if (isNaN(ci) || isNaN(idx) || !list[idx] || !candidateList[ci]) return;
+                    list[idx].bangumiBook = candidateList[ci];
+                    list[idx].manual = true;
+                    list[idx].selected = true;
+                    openPickerIndex = -1;
+                    noticeText = '';
+                    render();
+                };
+            });
+
+            bodyEl.querySelectorAll('.ks-as-book-checkbox').forEach(function(cb) {
+                if (cb.disabled) return;
+                cb.onchange = function() {
+                    const idx = parseInt(cb.getAttribute('data-index'), 10);
+                    if (!isNaN(idx) && list[idx]) list[idx].selected = cb.checked;
+                    refreshSelectionState();
+                };
+            });
+
+            if (selectAllCb) {
+                selectAllCb.onchange = function() {
+                    const target = selectAllCb.checked;
+                    list.forEach(function(p) { if (p && p.bangumiBook) p.selected = target; });
+                    render();
+                };
+            }
+
+            const orderBtn = bodyEl.querySelector('#ks-as-order-btn');
+            if (orderBtn) {
+                orderBtn.onclick = function() {
+                    orderPreview = planOrderPairing(orderIncludeUnknown);
+                    render();
+                };
+            }
+
+            refreshSelectionState();
+        }
 
         const contentHtml =
-            '<div style="padding:10px 0;">' +
-                '<div style="text-align:center;font-size:48px;margin-bottom:16px;">🤖</div>' +
-                '<div style="color:#fff;font-size:18px;font-weight:500;text-align:center;margin-bottom:12px;">开始自动刮削</div>' +
-                '<div style="color:rgba(255,255,255,0.7);font-size:14px;text-align:center;margin-bottom:16px;">' + escapeHtmlText(title) + '</div>' +
-                '<div style="background:rgba(255,255,255,0.05);border-radius:8px;padding:12px;margin-bottom:16px;">' +
-                    '<div style="color:rgba(255,255,255,0.8);font-size:14px;line-height:1.8;">' +
-                        '系列下书籍总数：<span style="color:#fff;font-weight:500;">' + String(totalBooks) + '</span><br/>' +
-                        'Bangumi 匹配数：<span style="color:#4caf50;font-weight:500;">' + String(matchedBooks) + '</span><br/>' +
-                        '无法匹配（跳过）：<span style="color:#ffb74d;font-weight:500;">' + String(totalBooks - matchedBooks) + '</span><br/>' +
-                        '本次将刮削（已勾选）：<span id="ks-as-selected-count" style="color:#4caf50;font-weight:500;">' + String(matchedBooks) + '</span> 本' +
-                    '</div>' +
-                '</div>' +
-                listHtml +
-                '<div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;line-height:1.6;">' +
-                    '逐本列表默认全选，可取消不想刮削的书；' +
-                    '点击「开始」后将逐本抓取 Bangumi 元数据并写入 Komga；' +
-                    '所有写入的字段会自动在 Komga 中加锁，防止被内置扫描覆盖；' +
-                    '文件名解析出卷号的书会顺带把「序号 / 排序序号」修正为该卷号。' +
-                '</div>' +
-                '<div id="ks-as-empty-hint" style="display:none;color:#ffb74d;font-size:12px;text-align:center;margin-bottom:12px;">没有可刮削的书（全部未匹配或已取消勾选）</div>' +
+            '<div style="padding:4px 0;">' +
+                '<div id="ks-as-body"></div>' +
                 '<div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">' +
                     '<button class="ks-btn ks-btn-secondary" id="ks-as-cancel">取消</button>' +
                     '<button class="ks-btn ks-btn-primary" id="ks-as-confirm">开始</button>' +
                 '</div>' +
             '</div>';
         const modal = createModalBase('自动刮削确认', contentHtml, null);
-        const listEl = document.getElementById('ks-as-list');
-        if (listEl) {
-            bindTitleTooltipDelegates(listEl);
-            modal.addEventListener('scroll', hideTitleTooltip, true);
-        }
+        modal.addEventListener('scroll', hideTitleTooltip, true);
 
-        // 逐本勾选的状态联动：全选框、已选计数、开始按钮可用性
-        const bookCheckboxes = modal.querySelectorAll('.ks-as-book-checkbox');
-        const selectAllCb = document.getElementById('ks-as-select-all');
-        const selectedCountEl = document.getElementById('ks-as-selected-count');
-        const confirmBtn = document.getElementById('ks-as-confirm');
-        const emptyHintEl = document.getElementById('ks-as-empty-hint');
-        const selectableCheckboxes = [];
-        bookCheckboxes.forEach(function(cb) {
-            if (!cb.disabled) selectableCheckboxes.push(cb);
-        });
-
-        function refreshSelectionState() {
-            let selected = 0;
-            selectableCheckboxes.forEach(function(cb) {
-                if (cb.checked) selected++;
-            });
-            if (selectedCountEl) selectedCountEl.textContent = String(selected);
-            if (selectAllCb) {
-                selectAllCb.checked = selectableCheckboxes.length > 0 && selected === selectableCheckboxes.length;
-                selectAllCb.indeterminate = selected > 0 && selected < selectableCheckboxes.length;
-                selectAllCb.disabled = selectableCheckboxes.length === 0;
-            }
-            if (confirmBtn) {
-                confirmBtn.disabled = selected === 0;
-                confirmBtn.style.opacity = selected === 0 ? '0.5' : '';
-                confirmBtn.style.cursor = selected === 0 ? 'not-allowed' : 'pointer';
-            }
-            if (emptyHintEl) emptyHintEl.style.display = selected === 0 ? 'block' : 'none';
-        }
-
-        bookCheckboxes.forEach(function(cb) {
-            cb.onchange = refreshSelectionState;
-        });
-        if (selectAllCb) {
-            selectAllCb.onchange = function() {
-                const target = selectAllCb.checked;
-                selectableCheckboxes.forEach(function(cb) { cb.checked = target; });
-                refreshSelectionState();
-            };
-        }
-        refreshSelectionState();
-
-        document.getElementById('ks-as-cancel').onclick = function() { modal.remove(); };
-        document.getElementById('ks-as-confirm').onclick = function() {
-            if (confirmBtn && confirmBtn.disabled) return;
-            const selectedPairs = [];
-            bookCheckboxes.forEach(function(cb) {
-                if (!cb.checked) return;
-                const idx = parseInt(cb.getAttribute('data-index'), 10);
-                if (!isNaN(idx) && list[idx]) selectedPairs.push(list[idx]);
-            });
+        modal.querySelector('#ks-as-cancel').onclick = function() { modal.remove(); };
+        modal.querySelector('#ks-as-confirm').onclick = function() {
+            const btn = modal.querySelector('#ks-as-confirm');
+            if (btn && btn.disabled) return;
+            const selectedPairs = list.filter(function(p) { return p && p.bangumiBook && p.selected; });
             modal.remove();
             onConfirm(selectedPairs);
         };
+
+        render();
     }
 
     async function startAutoScrape() {
@@ -5143,30 +5518,36 @@
                     (e && e.message ? e.message : '未知错误') + '）；这通常是 Bangumi 源站问题，请稍后重试');
                 return;
             }
-            if (!bangumiSubjectsRaw || bangumiSubjectsRaw.length === 0) {
-                closeAllModals();
-                showError('Bangumi 中没有找到子条目', '无法为该系列下的书籍匹配数据；请确认该 subject id 是否正确');
-                return;
-            }
-
+            // 该系列在 Bangumi 下一条书籍关系都没有时不再中断：照常打开确认弹窗、全部标未匹配，
+            // 用户至少能看到每本书失败的原因（此时候选列表为空，手动指定面板会是空的）。
             const bangumiBooks = bangumiSubjectsRaw.map(function(b) {
                 return {
                     id: b.id,
                     name: b.name,
                     nameCn: b.nameCn,
                     date: b.date,
+                    relation: b.relation,
                     volumeNumber: normalizeVolumeNumber(b.name, b.nameCn)
                 };
             });
 
             if (debug) console.log('[KomgaScraper] [Auto] Bangumi books parsed:', bangumiBooks);
+            if (debug && bangumiBooks.length === 0) {
+                console.log('[KomgaScraper] [Auto] Bangumi 系列下没有书籍子条目，确认弹窗里将全部显示未匹配');
+            }
 
             const pairs = matchBooksByNumber(komgaBooks, bangumiBooks);
             const total = pairs.length;
+            if (debug) {
+                const autoMatched = pairs.filter(function(p) { return p.bangumiBook; }).length;
+                const duplicateRows = pairs.filter(function(p) { return p.duplicate; }).length;
+                console.log('[KomgaScraper] [Auto] matched ' + autoMatched + ' / ' + pairs.length +
+                    ' books（重复卷号 ' + duplicateRows + ' 行）');
+            }
             const seriesTitle = (seriesData.metadata && seriesData.metadata.title) || seriesData.name || '';
 
             // 弹出确认框（含逐本映射预览），用户确认后再开始逐本刮削
-            showAutoScrapeConfirm(seriesTitle, pairs, function(selectedPairs) {
+            showAutoScrapeConfirm(seriesTitle, pairs, bangumiBooks, function(selectedPairs) {
                 runAutoScrapeLoop(selectedPairs, total);
             });
 
