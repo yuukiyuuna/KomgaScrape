@@ -1,10 +1,11 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.12
-// @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和 Fanza/DMM 手动刮削（FANZA 无结果时自动回退 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
+// @version      1.2.13
+// @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和「同人本搜索」手动刮削（FANZAブックス → DLsite → FANZA同人 → 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
+// @match        https://www.dlsite.com/*
 // @grant        GM_xmlhttpRequest
 // @grant        GM_setValue
 // @grant        GM_getValue
@@ -17,17 +18,20 @@
 // @connect      *
 // @connect      api.bgm.tv
 // @connect      www.dmm.co.jp
+// @connect      book.dmm.co.jp
 // @connect      doujin-assets.dmm.co.jp
 // @connect      www.suruga-ya.jp
+// @connect      www.dlsite.com
 // @require      https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js
 // @run-at       document-end
 // @sandbox      JavaScript
 // ==/UserScript==
 
 /*
- * 关于元数据块里的第二个 @match（https://www.suruga-ya.jp/*）：
- *   · 它是给「桥接标签页」用的（见脚本内模块 0）—— 駿河屋 直连被 Cloudflare 拦下时，
- *     脚本会开一个真实标签页去取搜索页 HTML，再回传给 Komga 页；
+ * 关于元数据块里的额外 @match（https://www.suruga-ya.jp/* 与 https://www.dlsite.com/*）：
+ *   · 它们是给「桥接标签页」用的（见脚本内模块 0）—— 駿河屋 直连被 Cloudflare 拦下、
+ *     或 DLsite 直连超时/被拦时，脚本会开一个真实标签页去取搜索页 HTML，再回传给 Komga 页；
+ *   · www.dlsite.com 的 @match 只需覆盖脚本实际桥接的搜索页（/books/fsr/...），当前用整站通配。
  *   · 不要删掉它，否则桥接标签页里没有脚本在跑，回传就无从发生；
  *   · 元数据块里 @match 的取值会一直取到行尾（不留行内注释），改动时请保持一行一个值。
  *
@@ -53,7 +57,7 @@
     'use strict';
 
     // ============================================================
-    // 0. 駿河屋「桥接标签页」模块
+    // 0. 駿河屋 / DLsite「桥接标签页」模块
     // ============================================================
     // 【为什么需要它】
     // 駿河屋（www.suruga-ya.jp）全站挂在 Cloudflare 后面。若本机出口 IP 被 Cloudflare
@@ -71,8 +75,11 @@
     //      发现「当前地址 == 请求记录里的地址」就等页面就绪，把整页 HTML 写回 GM 存储；
     //   4) Komga 页收到 HTML 后照常解析；若标签页停在人机校验页，桥接页会先回传
     //      challenge 状态，Komga 页据此提示用户切过去点一下「确认」。
+    // DLsite（www.dlsite.com）直连时同样会超时或收到拦截页（实测本机直连超时、
+    // 需走代理）；桥接标签页由真实浏览器发起导航，能复用浏览器本身的代理配置，
+    // 所以 DLsite 直连失败后走同一套桥接机制重取。
     // 注意：该模块必须在脚本最前面执行 —— 駿河屋标签页里要「只做桥接、不做 Komga 业务」。
-    const SURUGAYA_BRIDGE_HOST_RE = /(^|\.)suruga-ya\.jp$/i;
+    const BRIDGE_HOST_RE = /(^|\.)(suruga-ya\.jp|dlsite\.com)$/i;
     const SURUGAYA_BRIDGE_REQUEST_KEY = 'komga_scraper_surugaya_bridge_request';
     const SURUGAYA_BRIDGE_RESULT_KEY = 'komga_scraper_surugaya_bridge_result';
     const SURUGAYA_BRIDGE_REQUEST_TTL_MS = 120000;  // 请求记录有效期，超过即视为上一次的残留
@@ -86,6 +93,19 @@
         if (document.querySelector('div.item, #search_result, h3.product-name')) return true;
         const body = document.body;
         return !!(body && /該当件数/.test(body.innerText || body.textContent || ''));
+    }
+
+    /** 桥接页判定「DLsite 页面已经就绪」：命中搜索列表容器或作品详情标题 */
+    function isDlsitePageReady() {
+        if (document.querySelector('#search_result_list, #work_name')) return true;
+        const body = document.body;
+        return !!(body && /件中|作品が見つかりませんでした/.test(body.innerText || body.textContent || ''));
+    }
+
+    /** 桥接页判定「当前页面已经就绪」：按站点分派（駿河屋 / DLsite） */
+    function isBridgeTargetPageReady() {
+        if (/(^|\.)dlsite\.com$/i.test(location.hostname)) return isDlsitePageReady();
+        return isSurugayaSearchPageReady();
     }
 
     /** 比较键：忽略 URL 哈希，只比 origin + path + query（判断当前页是否就是桥接目标） */
@@ -123,7 +143,7 @@
         let challengeNotified = false;
         const timer = setInterval(function() {
             let result = null;
-            if (isSurugayaSearchPageReady()) {
+            if (isBridgeTargetPageReady()) {
                 result = {
                     id: request.id,
                     ok: true,
@@ -161,8 +181,8 @@
         watchSurugayaBridgePage(request);
     }
 
-    // 駿河屋 标签页：只做桥接，不再执行下面的 Komga 业务逻辑
-    if (SURUGAYA_BRIDGE_HOST_RE.test(location.hostname)) {
+    // 駿河屋 / DLsite 标签页：只做桥接，不再执行下面的 Komga 业务逻辑
+    if (BRIDGE_HOST_RE.test(location.hostname)) {
         runSurugayaBridgeTab();
         return;
     }
@@ -199,24 +219,24 @@
             };
 
             const timer = setTimeout(function() {
-                if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接标签页超时，未取到结果');
+                if (debug) console.warn('[KomgaScraper] 桥接标签页超时，未取到结果');
                 finish('');
             }, SURUGAYA_BRIDGE_TIMEOUT_MS);
 
             listenerId = GM_addValueChangeListener(SURUGAYA_BRIDGE_RESULT_KEY, function(name, oldValue, newValue) {
                 if (!newValue || newValue.id !== id) return;
                 if (newValue.phase === 'challenge') {
-                    if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接标签页停在 Cloudflare 人机校验页，等待用户完成');
+                    if (debug) console.warn('[KomgaScraper] 桥接标签页停在 Cloudflare 人机校验页，等待用户完成');
                     if (typeof onChallenge === 'function') {
                         try { onChallenge(); } catch (e) { }
                     }
                     return;
                 }
                 if (newValue.ok && newValue.html) {
-                    if (debug) console.log('[KomgaScraper] [Suruga-ya] 桥接标签页取回 HTML，长度:', newValue.html.length);
+                    if (debug) console.log('[KomgaScraper] 桥接标签页取回 HTML，长度:', newValue.html.length);
                     finish(newValue.html);
                 } else {
-                    if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接标签页失败:', newValue.reason || 'unknown');
+                    if (debug) console.warn('[KomgaScraper] 桥接标签页失败:', newValue.reason || 'unknown');
                     finish('');
                 }
             });
@@ -232,9 +252,9 @@
 
             try {
                 tab = GM_openInTab(url, { active: false, insert: true });
-                if (debug) console.log('[KomgaScraper] [Suruga-ya] 已打开桥接标签页:', url);
+                if (debug) console.log('[KomgaScraper] 已打开桥接标签页:', url);
             } catch (e) {
-                console.error('[KomgaScraper] [Suruga-ya] 打开桥接标签页失败:', e);
+                console.error('[KomgaScraper] 打开桥接标签页失败:', e);
                 finish('');
             }
         });
@@ -2182,8 +2202,12 @@
     }
 
     // ============================================================
-    // 7.5. Fanza (DMM) 刮削源
+    // 7.5. FANZA 同人 (DMM) 刮削源
     // ============================================================
+
+    // 「同人本搜索」链路里 FANZA同人 排第三：FANZAブックス（电子书区）→ DLsite → FANZA同人 → 駿河屋。
+    // DLsite 的成年漫画（如 BJ 系）在 DMM 一般归「電子書籍」区（book.dmm.co.jp），
+    // 同人区搜不到，所以同人区只能靠前两个源兜不住时再兜底。
 
     // 搜索走 FANZA 同人专用搜索页（/dc/doujin/-/search/）。
     // 不要用 www.dmm.co.jp/search/（全站搜索）：它的同人分区只在少数关键词下出现，
@@ -2332,17 +2356,50 @@
         return '';
     }
 
-    function describeFanzaBlocked(reason) {
-        if (reason === 'region') return 'FANZA/DMM 提示当前网络无法访问（地域限制）';
-        if (reason === 'age') return 'FANZA/DMM 要求年龄确认（返回了年齢認証页）';
-        if (reason === 'parse') return 'FANZA/DMM 结果页结构可能已变更（未解析到任何作品）';
-        return 'FANZA/DMM 请求失败';
+    function describeFanzaBlocked(reason, serviceName) {
+        const service = serviceName || 'FANZA/DMM';
+        if (reason === 'region') return service + ' 提示当前网络无法访问（地域限制）';
+        if (reason === 'age') return service + ' 要求年龄确认（返回了年齢認証页）';
+        if (reason === 'parse') return service + ' 结果页结构可能已变更（未解析到任何作品）';
+        if (reason === 'network') return service + ' 请求失败（连接被重置/超时），请检查网络后重试';
+        return service + ' 请求失败';
     }
 
-    function buildFanzaBlockedError(reason, detail) {
-        const err = new Error(detail || describeFanzaBlocked(reason));
+    function buildFanzaBlockedError(reason, detail, serviceName) {
+        const err = new Error(detail || describeFanzaBlocked(reason, serviceName));
         err.fanzaBlocked = reason;
+        err.fanzaService = serviceName || 'FANZA/DMM';
         return err;
+    }
+
+    /**
+     * 标题相关性归一化：NFKC 统一全角/半角 → 小写 → 去掉空白与标点（保留文字/数字/「ー」）。
+     * 日语标题里的「、」「？」「！」「（）」这类标点各站写法不一（半角/全角/省略），
+     * 直接字符串比较会误判，这里统一抹掉后再做互为包含判断。
+     */
+    function normalizeTitleForMatch(text) {
+        let value = String(text == null ? '' : text);
+        try {
+            value = value.normalize('NFKC');
+        } catch (e) { }
+        return value.toLowerCase()
+            .replace(/\s+/g, '')
+            .replace(/[!"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~、。・！＂＃＄％＆＇（）＊＋，－．／：；＜＝＞？＠［＼］＾＿｀｛｜｝～「」『』【】〔〕…‥—―‐]/g, '');
+    }
+
+    /**
+     * 搜索结果里是否存在「与关键词匹配」的条目：归一化后标题与关键词互为包含。
+     * 命中即认为该源搜到了目标作品，链路在该源停下；否则继续往下一个源搜。
+     */
+    function hasRelevantResults(keyword, results) {
+        const target = normalizeTitleForMatch(keyword);
+        if (!target || !results || results.length === 0) return false;
+        for (let i = 0; i < results.length; i++) {
+            const title = normalizeTitleForMatch(results[i] && (results[i].title || results[i].originalTitle));
+            if (!title) continue;
+            if (title.indexOf(target) !== -1 || target.indexOf(title) !== -1) return true;
+        }
+        return false;
     }
 
     function extractFanzaSearchTotal(html) {
@@ -2420,7 +2477,7 @@
 
             results.push({
                 source: 'fanza',
-                sourceLabel: 'FANZA/DMM',
+                sourceLabel: 'FANZA同人',
                 id: detailUrl,
                 url: detailUrl,
                 title: title,
@@ -2435,7 +2492,7 @@
                 airDate: '',
                 authors: [],
                 tags: [],
-                links: [{ label: 'Fanza', url: detailUrl }]
+                links: [{ label: 'FANZA同人', url: detailUrl }]
             });
         }
 
@@ -2476,7 +2533,7 @@
         }
 
         if (response.status !== 200 || !html) {
-            throw buildFanzaBlockedError('http', 'FANZA/DMM 请求失败（HTTP ' + response.status + '）');
+            throw buildFanzaBlockedError('http', 'FANZA 同人区请求失败（HTTP ' + response.status + '）');
         }
 
         const items = parseFanzaSearchItems(html);
@@ -2678,7 +2735,7 @@
                 tags: tags,
                 isbn: '',
                 url: url,
-                links: [{ label: 'Fanza', url: url }]
+                links: [{ label: 'FANZA同人', url: url }]
             };
 
         } catch (e) {
@@ -3022,6 +3079,653 @@
     }
 
     // ============================================================
+    // 7.7. FANZAブックス (book.dmm.co.jp) 刮削源
+    // ============================================================
+    // 「同人本搜索」链路的第一源。DLsite 的成年漫画（BJ 系）在 DMM 一般归电子书区
+    // （FANZAブックス），同人区（dc/doujin）搜不到，所以电子书区必须排在链路最前。
+    // 搜索页：https://book.dmm.co.jp/search/?searchstr={keyword}（0 命中也是 HTTP 200）。
+    // 详情页：https://book.dmm.co.jp/product/{seriesId}/{productId}/。
+
+    const FANZA_BOOKS_BASE = 'https://book.dmm.co.jp';
+    const FANZA_BOOKS_SEARCH_URL = 'https://book.dmm.co.jp/search/?searchstr={keyword}';
+    const FANZA_BOOKS_PRODUCT_RE = /^https?:\/\/book\.dmm\.co\.jp\/product\/[0-9]+\/[a-z0-9]+\/?/i;
+
+    /** 把 book.dmm.co.jp 上的相对/协议相对 URL 补全为绝对地址 */
+    function toFanzaBooksAbsoluteUrl(url) {
+        const value = String(url || '').trim();
+        if (!value) return '';
+        if (value.indexOf('//') === 0) return 'https:' + value;
+        if (value.indexOf('/') === 0) return FANZA_BOOKS_BASE + value;
+        return value;
+    }
+
+    /**
+     * 解析 FANZAブックス 搜索列表页（li.m-boxSearchBookProduct__item）。
+     * 返回结果数组；页面结构不认（连条目容器都没有）返回 null。
+     */
+    function parseFanzaBooksSearchItems(html) {
+        const doc = parseHtmlToDoc(html);
+        if (!doc) return null;
+
+        const nodes = doc.querySelectorAll('li.m-boxSearchBookProduct__item');
+        const results = [];
+
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const link = node.querySelector('a[href*="book.dmm.co.jp/product/"]');
+            if (!link) continue;
+
+            const detailUrl = toFanzaBooksAbsoluteUrl(link.getAttribute('href'));
+            if (!detailUrl || !FANZA_BOOKS_PRODUCT_RE.test(detailUrl)) continue;
+
+            let title = '';
+            const titleNode = node.querySelector('span.m-boxSearchListTmb__ttl') || node.querySelector('a[title]');
+            if (titleNode) {
+                title = String(titleNode.getAttribute('title') || titleNode.textContent || '').trim();
+            }
+            if (!title) {
+                const imgAlt = node.querySelector('img.m-bookImage__img[alt]') || node.querySelector('img[alt]');
+                title = imgAlt ? String(imgAlt.getAttribute('alt') || '').trim() : '';
+            }
+            if (!title) continue;
+
+            const imgNode = node.querySelector('img.m-bookImage__img') || node.querySelector('img');
+            const image = imgNode ? toFanzaBooksAbsoluteUrl(imgNode.getAttribute('src') || imgNode.getAttribute('data-src')) : '';
+
+            const productId = String(node.getAttribute('data-product-id') || '').trim();
+
+            results.push({
+                source: 'fanza-books',
+                sourceLabel: 'FANZAブックス',
+                id: productId || detailUrl,
+                url: detailUrl,
+                title: title,
+                originalTitle: title,
+                // 列表页没有简介/发售日/作者，选中后由 fetchFanzaBooksDetail 补全
+                summary: '',
+                image: image,
+                largeImage: image,
+                publisher: '',
+                rating: null,
+                isSeries: null,
+                airDate: '',
+                authors: [],
+                tags: [],
+                links: [{ label: 'FANZAブックス', url: detailUrl }]
+            });
+        }
+
+        return results;
+    }
+
+    function extractFanzaBooksSearchTotal(html) {
+        const m = String(html || '').match(/id="pagenationCount"[^>]*data-total="(\d+)"/);
+        if (!m) return null;
+        const num = parseInt(m[1], 10);
+        return isFinite(num) ? num : null;
+    }
+
+    /** 返回 { results, total }；被地域限制/年龄门禁/改版拦下时抛出带 fanzaBlocked 标记的错误 */
+    async function scrapeFromFanzaBooks(keyword) {
+        const serviceName = 'FANZAブックス';
+        const config = getConfig();
+        const debug = config.debug;
+
+        const searchUrl = FANZA_BOOKS_SEARCH_URL.replace('{keyword}', encodeURIComponent(keyword));
+        if (debug) console.log('[KomgaScraper] [Fanza-Books] Searching for:', keyword, '/ url:', searchUrl);
+
+        let response;
+        try {
+            response = await fetchWithRateLimit({
+                method: 'GET',
+                url: searchUrl,
+                headers: fanzaHeaders()
+            });
+        } catch (e) {
+            throw buildFanzaBlockedError('network', '', serviceName);
+        }
+
+        if (debug) console.log('[KomgaScraper] [Fanza-Books] Response status:', response.status);
+
+        const html = response.raw || '';
+
+        // 地域限制 / 年齢認証 页同样是 200，需要优先识别
+        const blocked = detectFanzaBlockedPage(html);
+        if (blocked) throw buildFanzaBlockedError(blocked, '', serviceName);
+
+        // 0 命中时 HTTP 200，页面明确写着「に一致する商品は見つかりませんでした」
+        const noHitPage = /に一致する商品は見つかりませんでした/.test(html);
+
+        if (response.status !== 200 || !html) {
+            throw buildFanzaBlockedError('http', serviceName + ' 请求失败（HTTP ' + response.status + '）', serviceName);
+        }
+
+        const items = parseFanzaBooksSearchItems(html);
+        if (items === null) throw buildFanzaBlockedError('parse', '', serviceName);
+
+        // 0 条且页面明确写着「未找到」才是真的没搜到，否则说明页面结构变了
+        if (items.length === 0 && !noHitPage) {
+            throw buildFanzaBlockedError('parse', '', serviceName);
+        }
+
+        const total = extractFanzaBooksSearchTotal(html);
+        if (debug) console.log('[KomgaScraper] [Fanza-Books] Parsed', items.length, 'items / total:', total);
+
+        return { results: items, total: total };
+    }
+
+    /** 从详情页信息表里取 dt 对应的 dd 文本（信息表行/定义列表两种结构都试） */
+    function extractFanzaBooksInfoValue(doc, label) {
+        let value = '';
+        doc.querySelectorAll('tr').forEach(function(tr) {
+            if (value) return;
+            const th = tr.querySelector('th');
+            const td = tr.querySelector('td');
+            if (!th || !td) return;
+            if (String(th.textContent || '').trim().indexOf(label) === -1) return;
+            value = String(td.textContent || '').replace(/\s+/g, ' ').trim();
+        });
+        if (value) return value;
+        doc.querySelectorAll('dt').forEach(function(dt) {
+            if (value) return;
+            if (String(dt.textContent || '').trim().indexOf(label) === -1) return;
+            const dd = dt.nextElementSibling;
+            if (dd) value = String(dd.textContent || '').replace(/\s+/g, ' ').trim();
+        });
+        return value;
+    }
+
+    /**
+     * 抓 FANZAブックス 商品详情页并解析成统一结构（与 fetchFanzaDetail 同形）。
+     * 地域限制/年齢認証/网络失败时返回 null（与 fetchFanzaDetail 的失败语义一致）。
+     */
+    async function fetchFanzaBooksDetail(url) {
+        const serviceName = 'FANZAブックス';
+        try {
+            const config = getConfig();
+            const debug = config.debug;
+
+            if (debug) console.log('[KomgaScraper] [Fanza-Books] Fetching detail:', url);
+
+            let response;
+            try {
+                response = await fetchWithRateLimit({
+                    method: 'GET',
+                    url: url,
+                    headers: fanzaHeaders()
+                });
+            } catch (e) {
+                console.warn('[KomgaScraper] [Fanza-Books] Detail request failed:', e && e.message);
+                return null;
+            }
+
+            if (response.status !== 200 || !response.raw) {
+                console.warn('[KomgaScraper] [Fanza-Books] Failed to get detail page');
+                return null;
+            }
+
+            const html = response.raw;
+
+            const blocked = detectFanzaBlockedPage(html);
+            if (blocked) {
+                console.warn('[KomgaScraper] [Fanza-Books] Detail page blocked:', blocked);
+                return null;
+            }
+
+            const doc = parseHtmlToDoc(html);
+            const metaTitle = extractMetaContent(html, 'og:title');
+            const title = metaTitle || (doc && doc.querySelector('title') ? String(doc.querySelector('title').textContent).trim() : '');
+            const image = extractMetaContent(html, 'og:image');
+            const description = extractMetaContent(html, 'og:description');
+
+            let author = '';
+            let publisher = '';
+            let releaseDate = '';
+            let category = '';
+            const tags = [];
+
+            if (doc) {
+                const authorNode = doc.querySelector('[data-testid="volume-detail-info-author"]');
+                if (authorNode) author = String(authorNode.textContent || '').replace(/\s+/g, ' ').trim();
+
+                const dateNode = doc.querySelector('[data-testid="volume-detail-info-content-publish-date"]');
+                if (dateNode) {
+                    const dm = String(dateNode.textContent || '').match(/(\d{4})[\/年.\-](\d{1,2})[\/月.\-](\d{1,2})/);
+                    if (dm) {
+                        releaseDate = dm[1] + '-' + (dm[2].length === 1 ? '0' : '') + dm[2] + '-' + (dm[3].length === 1 ? '0' : '') + dm[3];
+                    }
+                }
+
+                const categoryNode = doc.querySelector('[data-testid="volume-detail-info-category"]');
+                if (categoryNode) category = String(categoryNode.textContent || '').replace(/\s+/g, ' ').trim();
+
+                publisher = extractFanzaBooksInfoValue(doc, '出版社');
+
+                // ジャンル：详情页可能渲染多枚标签芯片，取到多个节点时全部收下（去重 + 黑名单过滤）
+                const genreNodes = doc.querySelectorAll('[data-testid="volume-detail-info-genre"]');
+                for (let i = 0; i < genreNodes.length; i++) {
+                    const texts = String(genreNodes[i].textContent || '').split(/[\s、,，/／]+/);
+                    for (let t = 0; t < texts.length; t++) {
+                        const value = texts[t].trim();
+                        if (!value) continue;
+                        if (FANZA_TAG_BLOCKLIST.indexOf(value) !== -1) continue;
+                        if (tags.indexOf(value) !== -1) continue;
+                        tags.push(value);
+                    }
+                }
+            }
+
+            // 年龄分级：分类里的「アダルトマンガ単話」等含「アダルト」即判定限制级
+            // （与 FANZA同人 的判定口径一致；判不出时不写，保持 Komga 原值）
+            const ageRating = /アダルト|成人/.test(category) ? ADULT_AGE_RATING : null;
+
+            if (debug) {
+                console.log('[KomgaScraper] [Fanza-Books] Parsed detail:', {
+                    title: title,
+                    releaseDate: releaseDate,
+                    author: author,
+                    publisher: publisher,
+                    category: category,
+                    tags: tags,
+                    ageRating: ageRating,
+                    image: image
+                });
+            }
+
+            return {
+                source: 'fanza-books',
+                id: url,
+                title: title,
+                originalTitle: title,
+                summary: description,
+                image: image,
+                largeImage: image,
+                rating: null,
+                status: 'Completed',
+                airDate: releaseDate,
+                date: releaseDate,
+                releaseDate: releaseDate,
+                pages: '',
+                authors: author ? [{ name: author, role: 'writer' }] : [],
+                publisher: publisher,
+                ageRating: ageRating,
+                tags: tags,
+                isbn: '',
+                url: url,
+                links: [{ label: 'FANZAブックス', url: url }]
+            };
+
+        } catch (e) {
+            console.error('[KomgaScraper] [Fanza-Books] Failed to fetch detail:', e);
+            return null;
+        }
+    }
+
+    // ============================================================
+    // 7.8. DLsite 刮削源（books 分区）
+    // ============================================================
+    // 「同人本搜索」链路的第二源，覆盖成年漫画（BJ 系）等分区。
+    // 搜索页：https://www.dlsite.com/books/fsr/=/keyword/{keyword}/（0 命中 HTTP 200，有 work_not_found 标记）。
+    // 访问策略：先 GM 直连；网络失败/被年龄门禁或改版拦下时，自动改用「桥接标签页」重取
+    // （真实浏览器导航可复用浏览器代理；受设置里的 surugayaBridgeTab 开关控制）。
+
+    const DLSITE_BASE = 'https://www.dlsite.com';
+    const DLSITE_SEARCH_URL = 'https://www.dlsite.com/books/fsr/=/keyword/{keyword}/';
+    const DLSITE_PRODUCT_RE = /\/work\/=\/product_id\/[A-Za-z0-9]+\.html/;
+    const DLSITE_WORK_NOT_FOUND_RE = /条件に一致する作品は見つかりませんでした/;
+
+    /** 从搜索结果条目里抠封面图：优先 thumb-candidates 里的 _img_main；没有就退回任意缩略图 */
+    function extractDlsiteItemImage(node) {
+        const html = node.outerHTML || '';
+        let m = html.match(/(?:https?:)?\/\/[^"'\s\\]+_img_main[^"'\s\\]*\.(?:webp|jpg|jpeg|png)/i);
+        if (!m) m = html.match(/(?:https?:)?\/\/[^"'\s\\]+\.(?:webp|jpg|jpeg|png)/i);
+        if (!m) return '';
+        let url = m[0];
+        if (url.indexOf('//') === 0) url = 'https:' + url;
+        // 列表缩略图（240x240）换成大图路径
+        return url.replace(/(_img_main)[^"'\/\\.]*\.(webp|jpg|jpeg|png)$/i, '$1.$2');
+    }
+
+    /**
+     * 解析 DLsite 搜索列表页（#search_result_list li[data-list_item_product_id]）。
+     * 返回结果数组；页面结构不认（连结果容器都没有）返回 null。
+     */
+    function parseDlsiteSearchItems(html) {
+        const doc = parseHtmlToDoc(html);
+        if (!doc) return null;
+
+        // 结果条目承载在 #search_result_list 容器里；这里直接按条目属性取（等价且不受容器层级影响）
+        const nodes = doc.querySelectorAll('li[data-list_item_product_id]');
+        const results = [];
+
+        for (let i = 0; i < nodes.length; i++) {
+            const node = nodes[i];
+            const productId = String(node.getAttribute('data-list_item_product_id') || '').trim();
+            if (!productId) continue;
+
+            const link = node.querySelector('dd.work_name a') || node.querySelector('a[href*="product_id/"]');
+            let productUrl = link ? String(link.getAttribute('href') || '').trim() : '';
+            if (productUrl.indexOf('//') === 0) {
+                productUrl = 'https:' + productUrl;
+            } else if (productUrl.indexOf('/') === 0) {
+                productUrl = DLSITE_BASE + productUrl;
+            }
+            if (!productUrl || !DLSITE_PRODUCT_RE.test(productUrl)) {
+                productUrl = DLSITE_BASE + '/books/work/=/product_id/' + productId + '.html';
+            }
+
+            // 标题优先取条目内的作品名链接文本；没有时退回条目标题属性 / 引号里的作品名（Vue 组件上以属性承载）
+            let title = link ? String(link.textContent || '').replace(/\s+/g, ' ').trim() : '';
+            if (!title) title = String(node.getAttribute('data-product_name') || '').trim();
+            if (!title) {
+                const m = (node.outerHTML || '').match(/alt="([^"]+)"/);
+                title = m ? m[1].replace(/\s+/g, ' ').trim() : '';
+            }
+            if (!title) continue;
+
+            const makerNode = node.querySelector('dd.maker_name a') || node.querySelector('dd.maker_name');
+            const maker = makerNode ? String(makerNode.textContent || '').replace(/\s+/g, ' ').trim() : '';
+
+            results.push({
+                source: 'dlsite',
+                sourceLabel: 'DLsite',
+                id: productId,
+                url: productUrl,
+                title: title,
+                originalTitle: title,
+                // 列表页没有简介/发售日/出版社，选中后由 fetchDlsiteDetail 补全
+                summary: '',
+                image: extractDlsiteItemImage(node),
+                largeImage: extractDlsiteItemImage(node),
+                publisher: '',
+                // サークル/品牌：详情页里会细化成 出版社名
+                circle: maker,
+                rating: null,
+                isSeries: null,
+                airDate: '',
+                authors: [],
+                tags: [],
+                links: [{ label: 'DLsite', url: productUrl }]
+            });
+        }
+
+        return results;
+    }
+
+    /** DLsite 搜索页是否真的「0 命中」（0 条目时用来区分空结果与改版） */
+    function isDlsiteNoHitPage(html) {
+        const text = String(html || '');
+        if (DLSITE_WORK_NOT_FOUND_RE.test(text)) return true;
+        const doc = parseHtmlToDoc(text);
+        return !!(doc && doc.querySelector('div.work_not_found'));
+    }
+
+    /** DLsite 被拦下/直连不可用错误的统一构造 */
+    function buildDlsiteBlockedError(reason, detail) {
+        const err = new Error(detail || 'DLsite 请求失败');
+        err.dlsiteBlocked = reason;
+        return err;
+    }
+
+    function describeDlsiteBlocked(reason) {
+        if (reason === 'network') {
+            return 'DLsite 直连失败（连接被重置/超时）。脚本会尝试改用「桥接标签页」重取；'
+                + '若仍失败，请让 www.dlsite.com 走代理（本机代理可用时把 DLsite 域名加进代理规则）后重试。';
+        }
+        if (reason === 'age') {
+            return 'DLsite 返回了年龄确认页。可先在浏览器里打开一次 www.dlsite.com 完成年龄确认，或让该域名走代理后重试。';
+        }
+        if (reason === 'http') return 'DLsite 请求失败（HTTP 状态异常）。请检查网络或代理后重试。';
+        return 'DLsite 结果页结构可能已变更（未解析到任何作品）';
+    }
+
+    /** 「同人本搜索」链路里的错误 → 中文描述（按错误标记分派，未知错误退回 message） */
+    function describeSearchChainError(e) {
+        if (!e) return '未知错误';
+        if (e.dlsiteBlocked) return describeDlsiteBlocked(e.dlsiteBlocked);
+        if (e.surugayaBlocked) return describeSurugayaBlocked(e.surugayaBlocked);
+        if (e.fanzaBlocked) return describeFanzaBlocked(e.fanzaBlocked, e.fanzaService);
+        return (e.message || '未知错误');
+    }
+
+    /**
+     * 取 DLsite 搜索页 HTML。
+     * 1) 先 GM 直连（无需 Cookie；本机直连不通时这一步会很快失败）；
+     * 2) 直连失败/被拦时，改用「桥接标签页」重取（见文件顶部模块 0，受 surugayaBridgeTab 开关控制）。
+     * 两条路都失败时抛出带 dlsiteBlocked 标记的错误。
+     */
+    async function fetchDlsiteSearchHtml(searchUrl, debug) {
+        let directError = null;
+        try {
+            const response = await fetchWithRateLimit({
+                method: 'GET',
+                url: searchUrl,
+                headers: Object.assign({}, EXTERNAL_HTML_HEADERS)
+            });
+
+            if (debug) console.log('[KomgaScraper] [Dlsite] Response status:', response.status);
+
+            const body = response.raw || '';
+            if (response.status === 200 && body) {
+                if (/年齢認証/.test(extractMetaContent(body, 'og:title')) || /<title[^>]*>[^<]*年齢認証/.test(body)) {
+                    throw buildDlsiteBlockedError('age');
+                }
+                return body;
+            }
+            directError = buildDlsiteBlockedError(response.status === 403 ? 'http' : 'network',
+                'DLsite 直连请求失败（HTTP ' + response.status + '）');
+        } catch (e) {
+            directError = (e && e.dlsiteBlocked) ? e : buildDlsiteBlockedError('network', 'DLsite 直连请求失败（' + (e && e.message ? e.message : '网络错误') + '）');
+        }
+
+        if (getConfig().surugayaBridgeTab === false || !surugayaBridgeSupported()) {
+            throw directError;
+        }
+
+        if (debug) console.log('[KomgaScraper] [Dlsite] 直连失败，改用桥接标签页重取');
+        const bridged = await fetchSurugayaViaBridge(searchUrl, debug, function() {
+            showLoading('DLsite 需要真人访问验证：请切到刚打开的 DLsite 标签页完成验证，脚本会自动继续');
+        });
+        if (bridged) return bridged;
+
+        throw directError;
+    }
+
+    function extractDlsiteSearchTotal(html) {
+        const doc = parseHtmlToDoc(html);
+        const container = doc ? (doc.querySelector('#search_result_list') || doc.querySelector('.work_index_main')) : null;
+        if (!container) return null;
+        const m = String(container.textContent || '').match(/([\d,]+)\s*件中/);
+        if (!m) return null;
+        const num = parseInt(m[1].replace(/,/g, ''), 10);
+        return isFinite(num) ? num : null;
+    }
+
+    /** 返回 { results, total }；直连+桥接均失败或改版时抛出带 dlsiteBlocked 标记的错误 */
+    async function searchDlsite(keyword) {
+        const config = getConfig();
+        const debug = config.debug;
+
+        const searchUrl = DLSITE_SEARCH_URL.replace('{keyword}', encodeURIComponent(keyword));
+        if (debug) console.log('[KomgaScraper] [Dlsite] Searching for:', keyword, '/ url:', searchUrl);
+
+        const html = await fetchDlsiteSearchHtml(searchUrl, debug);
+
+        const items = parseDlsiteSearchItems(html);
+        if (items === null) throw buildDlsiteBlockedError('parse');
+
+        // 0 条且页面有明确的「未找到」标记才是真的没搜到，否则说明页面结构变了
+        if (items.length === 0 && !isDlsiteNoHitPage(html)) {
+            throw buildDlsiteBlockedError('parse');
+        }
+
+        const total = extractDlsiteSearchTotal(html);
+        if (debug) console.log('[KomgaScraper] [Dlsite] Parsed', items.length, 'items / total:', total);
+
+        return { results: items, total: total };
+    }
+
+    /** 从 DLsite 详情页的信息表取 th 对应的 td 文本（先试 tr 结构，再退回结构类名） */
+    function extractDlsiteInfoValue(doc, label) {
+        let value = '';
+        doc.querySelectorAll('tr').forEach(function(row) {
+            if (value) return;
+            const th = row.querySelector('th');
+            const td = row.querySelector('td');
+            if (!th || !td) return;
+            if (String(th.textContent || '').trim().indexOf(label) === -1) return;
+            value = String(td.textContent || '').replace(/\s+/g, ' ').trim();
+            // DLsite 的出版社/品牌单元格里常带「フォローする」按钮文案，作为元数据要去掉
+            value = value.replace(/\s*フォローする\s*/g, '').trim();
+        });
+        if (value) return value;
+        doc.querySelectorAll('.work_short_info li, .work_info li, .work_short_info_author, .type_sales_info li').forEach(function(row) {
+            if (value) return;
+            const th = row.querySelector('th');
+            if (th) {
+                const td = row.querySelector('td');
+                if (td && String(th.textContent || '').trim().indexOf(label) !== -1) {
+                    value = String(td.textContent || '').replace(/\s+/g, ' ').trim();
+                    value = value.replace(/\s*フォローする\s*/g, '').trim();
+                }
+                return;
+            }
+            const strong = row.querySelector('strong');
+            const link = row.querySelector('a');
+            const strongText = strong ? String(strong.textContent || '').trim() : '';
+            if (strongText.indexOf(label) === -1) return;
+            let textAfter = '';
+            if (strong && strong.nextSibling) textAfter = String(strong.nextSibling.textContent || '');
+            if (!textAfter && link) textAfter = String(link.textContent || '');
+            value = String(textAfter).replace(/\s+/g, ' ').trim();
+            value = value.replace(/\s*フォローする\s*/g, '').trim();
+        });
+        return value;
+    }
+
+    /**
+     * 抓 DLsite 作品详情页并解析成统一结构（与 fetchFanzaDetail 同形）。
+     * 直连+桥接均失败时返回 null。
+     */
+    async function fetchDlsiteDetail(url) {
+        try {
+            const config = getConfig();
+            const debug = config.debug;
+
+            if (debug) console.log('[KomgaScraper] [Dlsite] Fetching detail:', url);
+
+            let html = '';
+            try {
+                const response = await fetchWithRateLimit({
+                    method: 'GET',
+                    url: url,
+                    headers: Object.assign({}, EXTERNAL_HTML_HEADERS)
+                });
+                if (response.status === 200 && response.raw) {
+                    html = response.raw;
+                }
+            } catch (e) {
+                if (debug) console.warn('[KomgaScraper] [Dlsite] 详情页直连失败:', e && e.message);
+            }
+
+            if (!html && getConfig().surugayaBridgeTab !== false && surugayaBridgeSupported()) {
+                if (debug) console.log('[KomgaScraper] [Dlsite] 详情页改用桥接标签页重取');
+                html = await fetchSurugayaViaBridge(url, debug, function() {
+                    showLoading('DLsite 需要真人访问验证：请切到刚打开的 DLsite 标签页完成验证，脚本会自动继续');
+                }) || '';
+            }
+
+            if (!html) {
+                console.warn('[KomgaScraper] [Dlsite] Failed to get detail page');
+                return null;
+            }
+
+            const doc = parseHtmlToDoc(html);
+            const metaTitle = extractMetaContent(html, 'og:title');
+            let title = metaTitle || (doc && doc.querySelector('title') ? String(doc.querySelector('title').textContent).trim() : '');
+            if (doc) {
+                const workNameNode = doc.querySelector('h1#work_name');
+                if (workNameNode) title = String(workNameNode.textContent || '').replace(/\s+/g, ' ').trim();
+            }
+            const image = extractMetaContent(html, 'og:image');
+
+            let summary = '';
+            let author = '';
+            let publisher = '';
+            let releaseDate = '';
+            let ageRating = null;
+            const tags = [];
+
+            if (doc) {
+                const descNode = doc.querySelector('[itemprop="description"]');
+                if (descNode) summary = String(descNode.textContent || '').replace(/\s+/g, ' ').trim();
+
+                author = extractDlsiteInfoValue(doc, '著者');
+                publisher = extractDlsiteInfoValue(doc, '出版社名');
+
+                const dateText = extractDlsiteInfoValue(doc, '販売日');
+                const dm = String(dateText || '').match(/(\d{4})[\/年.\-](\d{1,2})[\/月.\-](\d{1,2})/);
+                if (dm) {
+                    releaseDate = dm[1] + '-' + (dm[2].length === 1 ? '0' : '') + dm[2] + '-' + (dm[3].length === 1 ? '0' : '') + dm[3];
+                }
+
+                const genreText = extractDlsiteInfoValue(doc, 'ジャンル');
+                String(genreText || '').split(/[\s、,，/／]+/).forEach(function(value) {
+                    const tag = value.trim();
+                    if (!tag) return;
+                    if (FANZA_TAG_BLOCKLIST.indexOf(tag) !== -1) return;
+                    if (tags.indexOf(tag) !== -1) return;
+                    tags.push(tag);
+                });
+
+                // 年龄分级：年齢指定 里写明 R18 / 18禁 时判定限制级（判不出时不写）
+                const ageText = extractDlsiteInfoValue(doc, '年齢指定');
+                if (/r18|18禁|18歳?以上/i.test(ageText)) ageRating = ADULT_AGE_RATING;
+                if (!ageRating && doc.querySelector('img.icon_ADL')) ageRating = ADULT_AGE_RATING;
+            }
+
+            if (debug) {
+                console.log('[KomgaScraper] [Dlsite] Parsed detail:', {
+                    title: title,
+                    releaseDate: releaseDate,
+                    author: author,
+                    publisher: publisher,
+                    tags: tags,
+                    ageRating: ageRating,
+                    image: image
+                });
+            }
+
+            return {
+                source: 'dlsite',
+                id: url,
+                title: title,
+                originalTitle: title,
+                summary: summary,
+                image: image,
+                largeImage: image,
+                rating: null,
+                status: 'Completed',
+                airDate: releaseDate,
+                date: releaseDate,
+                releaseDate: releaseDate,
+                pages: '',
+                authors: author ? [{ name: author, role: 'writer' }] : [],
+                publisher: publisher,
+                ageRating: ageRating,
+                tags: tags,
+                isbn: '',
+                url: url,
+                links: [{ label: 'DLsite', url: url }]
+            };
+
+        } catch (e) {
+            console.error('[KomgaScraper] [Dlsite] Failed to fetch detail:', e);
+            return null;
+        }
+    }
+
+    // ============================================================
     // 8. UI 模块 - 按钮
     // ============================================================
 
@@ -3317,10 +4021,10 @@
 
                 <div class="ks-source-card" data-source="fanza" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:16px;margin-bottom:12px;border:1px solid rgba(255,255,255,0.08);cursor:pointer;transition:all 0.3s ease;">
                     <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
-                        <span style="color:#fff;font-size:16px;font-weight:500;">🌸 Fanza / DMM (同人本)</span>
+                        <span style="color:#fff;font-size:16px;font-weight:500;">🌸 同人本搜索</span>
                         <span style="font-size:12px;background:rgba(255,152,0,0.2);color:#ff9800;padding:4px 8px;border-radius:6px;">新</span>
                     </div>
-                    <div style="color:rgba(255,255,255,0.6);font-size:13px;margin-bottom:12px;">日本同人本/成人漫画数据库，日文数据，无需认证</div>
+                    <div style="color:rgba(255,255,255,0.6);font-size:13px;margin-bottom:12px;">依次检索 FANZAブックス、DLsite、FANZA同人，最后回退駿河屋；日文数据，无需认证</div>
                     <button class="ks-btn ks-btn-primary ks-btn-block" style="width:100%;padding:10px;">选择此源</button>
                 </div>
 
@@ -3850,7 +4554,7 @@
         const currentMetadata = currentData && currentData.metadata ? currentData.metadata : {};
         // 书籍页：父系列的元数据 DTO（用于渲染「同步到系列」字段的锁定态；取不到时按未锁定处理）
         const currentSeriesMetadata = seriesData && seriesData.metadata ? seriesData.metadata : {};
-        // 以抓到的数据自身来源为准：FANZA 流程兜底命中时拿到的是駿河屋的数据
+        // 以抓到的数据自身来源为准：「同人本搜索」链路可能停在 FANZAブックス / DLsite / FANZA同人 / 駿河屋
         const mapSource = (scrapeResult && scrapeResult.source) ? scrapeResult.source : source;
 
         let mappedMetadata;
@@ -3858,7 +4562,8 @@
             mappedMetadata = pageType === 'series'
                 ? mapSurugaYaToSeries(scrapeResult, currentMetadata)
                 : mapSurugaYaToBook(scrapeResult, currentMetadata);
-        } else if (mapSource === 'fanza') {
+        } else if (mapSource === 'fanza' || mapSource === 'fanza-books' || mapSource === 'dlsite') {
+            // FANZAブックス / DLsite 的详情结构与 FANZA同人 同形（title/summary/authors/releaseDate/…），共用映射
             mappedMetadata = pageType === 'series'
                 ? mapFanzaToSeries(scrapeResult, currentMetadata)
                 : mapFanzaToBook(scrapeResult, currentMetadata);
@@ -3938,8 +4643,9 @@
         }
 
         // 书籍页同步到所属系列：Komga 只在系列级有 title / titleSort / ageRating。
-        // 仅 FANZA 流程（source === 'fanza'，含駿河屋兜底）且能确定所属系列时提供这些字段。
-        if (pageType === 'book' && source === 'fanza' && currentData && currentData.seriesId) {
+        // 仅「同人本搜索」流程（FANZAブックス / DLsite / FANZA同人 / 駿河屋）且能确定所属系列时提供这些字段：
+        // 以实际命中的数据来源为准（mapSource 可能是前序源兜底后的结果），Bangumi 流程不提供。
+        if (pageType === 'book' && (mapSource === 'fanza' || mapSource === 'fanza-books' || mapSource === 'dlsite' || mapSource === 'surugaya') && currentData && currentData.seriesId) {
             const seriesTitleValue = String(mappedMetadata.title || '').trim();
             if (seriesTitleValue) {
                 fields.push({ key: '__seriesTitle', label: '系列标题（同步到系列）', type: 'text', value: seriesTitleValue, checked: !isSeriesFieldLocked('title'), locked: isSeriesFieldLocked('title') });
@@ -4275,9 +4981,9 @@
             <div style="margin-bottom:20px;">
                 <div style="display:flex;align-items:center;gap:8px;cursor:pointer;">
                     <input type="checkbox" id="ks-setting-surugaya-bridge" ${config.surugayaBridgeTab !== false ? 'checked' : ''} style="width:18px;height:18px;accent-color:#667eea;cursor:pointer;">
-                    <label for="ks-setting-surugaya-bridge" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">駿河屋 被 Cloudflare 拦下时自动开「桥接标签页」重取</label>
+                    <label for="ks-setting-surugaya-bridge" style="color:rgba(255,255,255,0.7);font-size:13px;cursor:pointer;">駿河屋 / DLsite 被拦截或无法直连时自动开「桥接标签页」重取</label>
                 </div>
-                <div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:4px;">关闭后，駿河屋 兜底只会直连请求；本机 IP 被人机校验拦住时会直接报错。</div>
+                <div style="color:rgba(255,255,255,0.4);font-size:12px;margin-top:4px;">关闭后，駿河屋 / DLsite 只会直连请求；直连不通（Cloudflare 人机校验 / 连接超时）时会直接报错。</div>
             </div>
 
             <div style="display:flex;gap:10px;justify-content:flex-end;margin-top:24px;padding-top:16px;border-top:1px solid rgba(255,255,255,0.1);">
@@ -4371,7 +5077,7 @@
             } else if (pageType === 'series') {
                 searchTitle = currentData.metadata && currentData.metadata.title ? currentData.metadata.title : currentData.name;
             } else {
-                const isFanza = source === 'fanza';
+                const isDoujinSearch = source === 'fanza';
                 const seriesTitle = currentData.seriesTitle ? currentData.seriesTitle.trim() : '';
                 // 卷号以文件名为准：Komga 的 number 只是按位置重编号的结果，
                 // 用它拼关键词会去搜错误的卷（如第10巻被当成第3巻）
@@ -4381,9 +5087,10 @@
                     : (currentData.metadata && currentData.metadata.number ? String(currentData.metadata.number).trim() : '');
                 const bookName = (currentData.metadata && currentData.metadata.title) || currentData.name || '';
 
-                if (isFanza) {
-                    // FANZA/DMM 面向同人本：一本就是一个作品，绝大多数没有「卷」的概念，
-                    // 拼上系列名只会把关键词搞得过窄（实测「系列名 + 书名」在 FANZA 上搜不到），
+                if (isDoujinSearch) {
+                    // 「同人本搜索」链路（FANZAブックス / DLsite / FANZA同人 / 駿河屋）里绝大多数作品
+                    // 是「一本即一个作品」，没有「卷」的概念；拼上系列名只会把关键词搞得过窄
+                    //（实测「系列名 + 书名」在 FANZA 上搜不到），
                     // 所以书名本身能用就直接用书名；只有书名缺失或只是纯卷标（第3話 / Vol.2）时才拼系列名
                     if (bookName && !isVolumeMarkerOnly(bookName)) {
                         searchTitle = bookName;
@@ -4415,96 +5122,126 @@
             if (config.debug) console.log('[KomgaScraper] Searching for:', cleanKeyword);
             loading.remove();
 
-            const isFanza = source === 'fanza';
-            const sourceLabel = isFanza ? 'Fanza/DMM' : 'Bangumi';
+            const isDoujinSearch = source === 'fanza';
+            const sourceLabel = isDoujinSearch ? '同人本搜索' : 'Bangumi';
             showLoading('正在搜索 ' + sourceLabel + ': ' + cleanKeyword);
 
             const doRetry = function(newKeyword) {
                 startScrapeProcess(source, newKeyword);
             };
 
-            let searchResults;
-            let searchTotal = null;
+            let searchResults = [];
+            let searchTotalCount = null;
             let searchVia = '';
             let searchNotice = '';
-            try {
-                if (isFanza) {
-                    searchVia = 'fanza';
-                    let fanzaError = null;
+            if (isDoujinSearch) {
+                // 「同人本搜索」四源串行链路：
+                // 1) FANZAブックス（电子书区，DLsite 成年漫画在 DMM 的实际归属）
+                // 2) DLsite（books 分区，直连不通时自动走桥接标签页）
+                // 3) FANZA同人（dc/doujin，同人区）
+                // 4) 駿河屋（最后兜底）
+                // 规则：某源出现与书名匹配的结果即在该源停下展示；有结果但不匹配则跳过继续往下；
+                //       请求出错则记录错误后继续往下。结果永不混排，卡片来源角标区分。
+                const SEARCH_CHAIN = [
+                    { key: 'fanza-books', label: 'FANZAブックス', search: scrapeFromFanzaBooks },
+                    { key: 'dlsite', label: 'DLsite', search: searchDlsite },
+                    { key: 'fanza', label: 'FANZA同人', search: scrapeFromFanza },
+                    { key: 'surugaya', label: '駿河屋', search: searchSurugaYa }
+                ];
+
+                const chainNotes = [];
+                const chainErrors = [];
+                let firstResultSource = null;
+                let matched = false;
+
+                for (let i = 0; i < SEARCH_CHAIN.length; i++) {
+                    const chainSource = SEARCH_CHAIN[i];
+                    showLoading('正在搜索 ' + chainSource.label + ': ' + cleanKeyword);
+
+                    let sourceResults = null;
+                    let sourceTotal = null;
                     try {
-                        const fanzaSearch = await scrapeFromFanza(cleanKeyword);
-                        searchResults = fanzaSearch.results;
-                        searchTotal = fanzaSearch.total;
-                    } catch (fanzaErr) {
-                        console.warn('[KomgaScraper] [Fanza] Search failed, will try Suruga-ya fallback:', fanzaErr);
-                        fanzaError = fanzaErr;
-                        searchResults = [];
+                        const sourceSearch = await chainSource.search(cleanKeyword);
+                        sourceResults = sourceSearch.results || [];
+                        sourceTotal = sourceSearch.total;
+                    } catch (sourceErr) {
+                        chainErrors.push({ key: chainSource.key, label: chainSource.label, error: sourceErr });
+                        console.warn('[KomgaScraper] [' + chainSource.label + '] Search failed, trying next source:', sourceErr);
+                        chainNotes.push('「' + chainSource.label + '」搜索失败（' + (sourceErr && sourceErr.message ? sourceErr.message : '未知错误') + '）');
+                        continue;
                     }
 
-                    // 駿河屋只作兜底：FANZA 无结果或请求失败时才查，两个源的结果绝不混排
-                    if (searchResults.length === 0) {
-                        let fallback = null;
-                        let fallbackError = null;
-                        try {
-                            fallback = await searchSurugaYa(cleanKeyword);
-                        } catch (surugayaErr) {
-                            fallbackError = surugayaErr;
-                        }
-
-                        if (fallback && fallback.results.length > 0) {
-                            searchResults = fallback.results;
-                            searchTotal = fallback.total;
-                            searchVia = 'surugaya';
-                            searchNotice = (fanzaError
-                                ? 'FANZA/DMM 搜索失败（' + describeFanzaBlocked(fanzaError.fanzaBlocked) + '）'
-                                : 'FANZA/DMM 未找到结果')
-                                + '，已自动改用「駿河屋」兜底';
-                        } else if (fanzaError) {
-                            // 兜底也没结果：优先报 FANZA 的原始错误（更有诊断价值）
-                            throw fanzaError;
-                        } else if (fallbackError) {
-                            throw fallbackError;
-                        } else {
-                            searchNotice = 'FANZA/DMM 与 駿河屋 均未找到结果';
-                        }
+                    if (!firstResultSource && sourceResults.length > 0) {
+                        firstResultSource = { key: chainSource.key, label: chainSource.label, results: sourceResults, total: sourceTotal };
                     }
-                } else {
+
+                    if (hasRelevantResults(cleanKeyword, sourceResults)) {
+                        searchResults = sourceResults;
+                        searchTotalCount = sourceTotal;
+                        searchVia = chainSource.key;
+                        matched = true;
+                        if (i > 0) {
+                            chainNotes.push('已改用「' + chainSource.label + '」（前面 ' + i + ' 个源未找到精确匹配）');
+                        }
+                        break;
+                    }
+
+                    if (sourceResults.length > 0) {
+                        chainNotes.push('「' + chainSource.label + '」' + sourceResults.length + ' 条相近结果（均已跳过）');
+                    } else {
+                        chainNotes.push('「' + chainSource.label + '」无结果');
+                    }
+                }
+
+                if (!matched) {
+                    if (firstResultSource) {
+                        // 所有源都没有与书名精确匹配的结果：展示第一个有结果的源（不混排），
+                        // 并提示用户可「修改搜索词」重试
+                        searchResults = firstResultSource.results;
+                        searchTotalCount = firstResultSource.total;
+                        searchVia = firstResultSource.key;
+                        chainNotes.push('未找到精确匹配，以下为「' + firstResultSource.label + '」的相近结果（可点「修改搜索词」重试）');
+                        if (chainErrors.length > 0) {
+                            const firstError = chainErrors[0];
+                            chainNotes.push('「' + firstError.label + '」搜索失败：' + describeSearchChainError(firstError.error));
+                        }
+                        searchNotice = '同人本搜索：' + chainNotes.join('；');
+                    } else if (chainErrors.length > 0) {
+                        // 一个结果都没有：抛出第一个错误（更有诊断价值）
+                        throw chainErrors[0].error;
+                    } else {
+                        searchNotice = chainNotes.join('；') + '；均未找到结果，可点「修改搜索词」重试';
+                        showError('未找到搜索结果', 'FANZAブックス / DLsite / FANZA同人 / 駿河屋 均未找到「' + cleanKeyword + '」', function() {
+                            startScrapeProcess(source, cleanKeyword);
+                        });
+                        return;
+                    }
+                } else if (chainNotes.length > 0) {
+                    searchNotice = '同人本搜索：' + chainNotes.join('；');
+                }
+            } else {
+                try {
                     // 分页只由 v0 承担：首屏按配置拉取，offset 由「加载更多」传入
                     const bangumiSearch = await scrapeFromBangumi(cleanKeyword, { offset: 0, limit: getSearchFetchLimit() });
                     searchResults = bangumiSearch.results;
-                    searchTotal = bangumiSearch.total;
+                    searchTotalCount = bangumiSearch.total;
                     searchVia = bangumiSearch.via;
                     searchNotice = bangumiSearch.notice;
-                }
-            } catch (e) {
-                loading.remove();
-                if (e && e.bangumiApiError) {
-                    const retryKeyword = cleanKeyword;
-                    showError('Bangumi 搜索接口不可用', 'Bangumi 接口暂时无法访问（' + (e.message || '未知错误') +
-                        '），通常是 Bangumi 源站问题，请稍后重试', function() {
-                        startScrapeProcess(source, retryKeyword);
+                } catch (e) {
+                    loading.remove();
+                    if (e && e.bangumiApiError) {
+                        const retryKeyword = cleanKeyword;
+                        showError('Bangumi 搜索接口不可用', 'Bangumi 接口暂时无法访问（' + (e.message || '未知错误') +
+                            '），通常是 Bangumi 源站问题，请稍后重试', function() {
+                            startScrapeProcess(source, retryKeyword);
+                        });
+                        return;
+                    }
+                    showError('搜索请求失败', '请检查网络连接', function() {
+                        startScrapeProcess(source);
                     });
                     return;
                 }
-                if (e && e.fanzaBlocked) {
-                    const retryKeyword = cleanKeyword;
-                    showError('无法访问 FANZA/DMM', describeFanzaBlocked(e.fanzaBlocked) +
-                        '（已尝试用駿河屋兜底，同样没有结果）', function() {
-                        startScrapeProcess(source, retryKeyword);
-                    });
-                    return;
-                }
-                if (e && e.surugayaBlocked) {
-                    const retryKeyword = cleanKeyword;
-                    showError('无法访问 駿河屋', describeSurugayaBlocked(e.surugayaBlocked), function() {
-                        startScrapeProcess(source, retryKeyword);
-                    });
-                    return;
-                }
-                showError('搜索请求失败', '请检查网络连接', function() {
-                    startScrapeProcess(source);
-                });
-                return;
             }
 
             loading.remove();
@@ -4516,7 +5253,14 @@
                 if (selectedSource === 'surugaya') {
                     // 駿河屋 搜索列表页已含全部可用字段，不用再抓（且详情页有 Cloudflare 校验）
                     detail = selectedResult;
-                } else if (isFanza) {
+                } else if (selectedSource === 'fanza-books') {
+                    detail = await fetchFanzaBooksDetail(selectedResult.url);
+                } else if (selectedSource === 'dlsite') {
+                    detail = await fetchDlsiteDetail(selectedResult.url);
+                } else if (selectedSource === 'fanza') {
+                    detail = await fetchFanzaDetail(selectedResult.url);
+                } else if (isDoujinSearch) {
+                    // 兜底：结果来自未知来源时按当前流程再试 FANZA 详情
                     detail = await fetchFanzaDetail(selectedResult.url);
                 } else {
                     detail = await fetchSubjectDetail(selectedResult.id);
@@ -4525,14 +5269,14 @@
                 // 书籍页需要父系列的元数据：把「系列标题 / 排序标题 / 分级」同步回所属系列时，
                 // 要用它渲染锁定态（取不到时按未锁定处理，不阻断刮削）
                 let seriesData = null;
-                if (pageType === 'book' && isFanza && currentData && currentData.seriesId) {
+                if (pageType === 'book' && isDoujinSearch && currentData && currentData.seriesId) {
                     seriesData = await fetchSeriesData(currentData.seriesId);
                 }
                 closeAllModals();
 
                 if (!detail) {
                     showError('获取详情失败', '无法获取详细数据，将使用搜索结果');
-                    showMetadataPreview(selectedResult, currentData, pageType, source, function(selectedFields, updatedFields) {
+                    showMetadataPreview(selectedResult, currentData, pageType, selectedSource, function(selectedFields, updatedFields) {
                         if (Object.keys(selectedFields).length === 0) {
                             showError('未选择任何字段', '请至少勾选一个要更新的字段');
                             return;
@@ -4542,7 +5286,7 @@
                     return;
                 }
 
-                showMetadataPreview(detail, currentData, pageType, source, function(selectedFields, updatedFields) {
+                showMetadataPreview(detail, currentData, pageType, selectedSource, function(selectedFields, updatedFields) {
                     if (Object.keys(selectedFields).length === 0) {
                         showError('未选择任何字段', '请至少勾选一个要更新的字段');
                         return;
@@ -4553,7 +5297,7 @@
             };
 
             // 「加载更多」只在 v0 首屏结果上提供：旧接口降级没有总数、也无法稳定分页
-            const onLoadMore = (!isFanza && searchVia === 'v0')
+            const onLoadMore = (!isDoujinSearch && searchVia === 'v0')
                 ? async function(offset) {
                     const page = await scrapeFromBangumi(cleanKeyword, { offset: offset, limit: getSearchFetchLimit() });
                     return { results: page.results, total: page.total };
@@ -4562,7 +5306,7 @@
 
             showSearchResults({
                 results: searchResults,
-                total: searchTotal,
+                total: searchTotalCount,
                 via: searchVia,
                 source: source,
                 pageType: pageType,
@@ -4575,6 +5319,29 @@
 
         } catch (e) {
             console.error('[KomgaScraper] Scrape process failed:', e);
+            // 「同人本搜索」链路里所有源都失败时会抛出第一个错误（带各自标记），这里给出对应文案
+            if (e && e.dlsiteBlocked) {
+                const retryKeyword = cleanKeyword || '';
+                showError('无法访问 DLsite', describeDlsiteBlocked(e.dlsiteBlocked), function() {
+                    startScrapeProcess(source, retryKeyword);
+                });
+                return;
+            }
+            if (e && e.surugayaBlocked) {
+                const retryKeyword = cleanKeyword || '';
+                showError('无法访问 駿河屋', describeSurugayaBlocked(e.surugayaBlocked), function() {
+                    startScrapeProcess(source, retryKeyword);
+                });
+                return;
+            }
+            if (e && e.fanzaBlocked) {
+                const retryKeyword = cleanKeyword || '';
+                const service = e.fanzaService || 'FANZA/DMM';
+                showError('无法访问 ' + service, describeFanzaBlocked(e.fanzaBlocked, e.fanzaService), function() {
+                    startScrapeProcess(source, retryKeyword);
+                });
+                return;
+            }
             showError('刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
         }
     }
@@ -5463,8 +6230,9 @@
     }
 
     async function startAutoScrape() {
-        // 自动刮削仅支持 Bangumi 源。Fanza/DMM 源主要是同人本，命名不规范、数量通常较少，
-        // 不提供自动刮削功能；如需刮取 Fanza 系列请使用页面上的“刮削”按钮手动执行。
+        // 自动刮削仅支持 Bangumi 源。「同人本搜索」链路（FANZAブックス / DLsite / FANZA同人 / 駿河屋）
+        // 主要是同人本 / 単話，命名不规范、数量通常较少，不提供自动刮削功能；
+        // 需要抓取这些源时请使用页面上的“刮削”按钮手动执行。
         try {
             closeAllModals();
             const config = getConfig();
