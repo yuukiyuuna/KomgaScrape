@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.14
+// @version      1.2.15
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和「同人本搜索」手动刮削（FANZAブックス → DLsite → FANZA同人 → 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
@@ -69,7 +69,7 @@
     //
     // 【做法】把「你手动开标签页过验证」这套动作自动化：
     //   1) Komga 页直连被拦后，把请求写进 GM 存储（komga_scraper_surugaya_bridge_request）；
-    //   2) 用 GM_openInTab 在后台打开目标搜索页 URL；
+    //   2) 用 GM_openInTab 在后台打开目标页 URL（搜索列表页或商品详情页）；
     //   3) 本文件的同一份脚本会在駿河屋标签页里运行（@match 里有 suruga-ya.jp），
     //      发现「当前地址 == 请求记录里的地址」就等页面就绪，把整页 HTML 写回 GM 存储；
     //   4) Komga 页收到 HTML 后照常解析；若标签页停在人机校验页，桥接页会先回传
@@ -87,9 +87,13 @@
     // Cloudflare 校验页的标题（英文站 / 日文站都覆盖），用来识别「还没过校验」
     const SURUGAYA_BRIDGE_CHALLENGE_RE = /Just a moment|Attention Required|しばらくお待ちください|確認中/;
 
-    /** 桥接页判定「搜索页已经就绪」：命中列表容器或「該当件数」文案 */
-    function isSurugayaSearchPageReady() {
+    /**
+     * 桥接页判定「页面已经就绪」（v1.2.15 起同一条桥接既服务搜索列表页、也服务商品详情页）：
+     * 列表页命中条目容器 / 「該当件数」文案，商品详情页命中「商品詳細情報」表或商品编号单元格。
+     */
+    function isSurugayaBridgePageReady() {
         if (document.querySelector('div.item, #search_result, h3.product-name')) return true;
+        if (document.querySelector('table.tbl_product_info, #proid')) return true;
         const body = document.body;
         return !!(body && /該当件数/.test(body.innerText || body.textContent || ''));
     }
@@ -129,7 +133,7 @@
         let challengeNotified = false;
         const timer = setInterval(function() {
             let result = null;
-            if (isSurugayaSearchPageReady()) {
+            if (isSurugayaBridgePageReady()) {
                 result = {
                     id: request.id,
                     ok: true,
@@ -2653,13 +2657,23 @@
 
             let releaseDate = '';
             let pageCount = '';
-            let author = '';
             let publisher = '';
             let ageRating = null;
             const tags = [];
             const infoKeysRaw = {};
             // 信息表里 dd 内的链接文本（FANZA 的「ジャンル」是一串 <a>，拼成整串文本没法切分）
             const infoKeyLinks = {};
+            // 创作者收集（v1.2.15 起支持多字段多人）：作者 / 著者 / 作家 / 原作者 / シナリオ / 脚本 / イラスト / 作画；
+            // 「声優」不是创作者，不收集（Komga 这里只收录漫画）。イラスト / 作画 → artist（预览显示「作画」），
+            // 其余 → writer；跨字段按名去重（同名先到先得），避免「作者 + シナリオ」重复列同一个人。
+            const authors = [];
+            const seenFanzaAuthors = {};
+            const pushFanzaAuthor = function(name, role) {
+                const clean = String(name || '').replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').replace(/\s+/g, ' ').trim();
+                if (!clean || seenFanzaAuthors[clean]) return;
+                seenFanzaAuthors[clean] = true;
+                authors.push({ name: clean, role: role });
+            };
 
             if (doc) {
                 const tableRows = doc.querySelectorAll('table tr, div[class*="information"] tr, dl[class*="info"] dt, dl[class*="info"] dd');
@@ -2726,8 +2740,15 @@
                     const pm = val.match(/(\d+)/);
                     if (pm) pageCount = pm[1];
                 }
-                if (/作者|著者|creator|author|作家/i.test(k)) {
-                    if (!author) author = val.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
+                if (/作者|著者|作家|原作者|シナリオ|脚本|イラスト|作画|creator|author/i.test(k)) {
+                    // 每个创作者字段可能一格多人：优先取 dd 里逐个链接的文本（每人一个 <a>），
+                    // 没有链接才按「 / 」拆分整格文本（多名字段拼成一整条会在写库校验处被整条丢弃）
+                    const isArtistRole = /イラスト|作画/i.test(k);
+                    const linkedNames = infoKeyLinks[k];
+                    const names = (linkedNames && linkedNames.length > 0) ? linkedNames : val.split(/\s*\/\s*/);
+                    names.forEach(function(name) {
+                        pushFanzaAuthor(name, isArtistRole ? 'artist' : 'writer');
+                    });
                 }
                 if (/出版社|ブランド|メーカー|レーベル|サークル/i.test(k)) {
                     if (!publisher) publisher = val.replace(/\[.*?\]/g, '').replace(/\(.*?\)/g, '').trim();
@@ -2760,10 +2781,11 @@
                 }
             }
 
-            if (!author) {
+            if (authors.length === 0) {
+                // 全无创作者字段（纯声優作品等）：保留旧回退 —— 标题括号里的圈名当作者
                 const circleMatch = title.match(/\((.+?)\)/);
                 if (circleMatch && circleMatch[1] && circleMatch[1].length <= 30) {
-                    author = circleMatch[1].trim();
+                    pushFanzaAuthor(circleMatch[1].trim(), 'writer');
                 }
             }
 
@@ -2772,7 +2794,7 @@
                     title: title,
                     releaseDate: releaseDate,
                     pageCount: pageCount,
-                    author: author,
+                    authors: authors,
                     tags: tags,
                     ageRating: ageRating,
                     image: imageMeta
@@ -2793,7 +2815,7 @@
                 date: releaseDate,
                 releaseDate: releaseDate,
                 pages: pageCount,
-                authors: author ? [{ name: author, role: 'writer' }] : [],
+                authors: authors,
                 publisher: publisher,
                 ageRating: ageRating,
                 tags: tags,
@@ -2874,8 +2896,10 @@
     // 7.6. 駿河屋 (Suruga-ya) 兜底源
     // ============================================================
     // 只在 FANZA/DMM 搜不到（或请求失败）时才启用，绝不与 FANZA 结果混排。
-    // 只解析搜索列表页：商品详情页 /product/detail/* 有 Cloudflare 人机校验，
-    // 而列表页已含 作品名 / 作者 / サークル / 発売日 / 封面 / 商品链接。
+    // 搜索解析列表页（作品名 / 作者 / サークル / 発売日 / 封面 / 商品链接）；
+    // v1.2.15 起选中结果后还会补抓商品详情页 /product/detail/*，用「商品詳細情報」表
+    // 补全作者（列表页只列前两位）与「備考」简介 —— 详情页同样挂在 Cloudflare 后面，
+    // 复用与搜索页相同的桥接兜底；补全失败一律静默退回列表页数据，绝不阻断刮削。
 
     /**
      * 駿河屋商品名形如「作品名 / 作者 / サークル」，另有单独的 [サークル] 字段可作准绳：
@@ -2998,6 +3022,79 @@
         return results;
     }
 
+    /**
+     * 解析駿河屋商品详情页「商品詳細情報」表（table.tbl_product_info）。
+     * 作者口径（详情页比列表页全得多，如 ZHORO49041 列表页只有 2 位、详情页有 24 位）：
+     *   · td 里带 person_id 链接的单元格：取全部链接文本（与 th 标签无关，合同本里一格一人）；
+     *   · 没有链接、但标签属于作者类的单元格：取整格文本；
+     *   · 画 / イラスト / 作画 → artist（预览显示「作画」），其余（著 / 作者 / 作）→ writer；
+     *   · 按单元格出现顺序收集、按名去重，保留原名（如 U35(うみこ) 不剥括号）。
+     * 简介取「備考」标题后第一个 div 里的 p 文本（<br> 转空格、压缩空白）。
+     * 解析不到时返回 { authors: [], summary: '' }，由调用方静默降级。
+     */
+    function parseSurugayaDetailInfo(html) {
+        const result = { authors: [], summary: '' };
+        const doc = parseHtmlToDoc(html);
+        if (!doc) return result;
+
+        const seen = {};
+        const pushAuthor = function(name, role) {
+            const clean = String(name || '').replace(/\s+/g, ' ').trim();
+            if (!clean || seen[clean]) return;
+            seen[clean] = true;
+            result.authors.push({ name: clean, role: role });
+        };
+        const roleOf = function(label) {
+            return /^(画|イラスト|作画)$/.test(label) ? 'artist' : 'writer';
+        };
+        // 单元格文本转干净字符串：先把 <br> 换成空格（備考 等多行文本会丢换行）
+        const textOf = function(node) {
+            const clone = node.cloneNode(true);
+            const brs = clone.querySelectorAll('br');
+            for (let i = 0; i < brs.length; i++) {
+                const space = clone.ownerDocument.createTextNode(' ');
+                brs[i].parentNode.replaceChild(space, brs[i]);
+            }
+            return String(clone.textContent || '').replace(/\s+/g, ' ').trim();
+        };
+
+        const table = doc.querySelector('table.tbl_product_info');
+        if (table) {
+            const cells = table.querySelectorAll('td');
+            for (let i = 0; i < cells.length; i++) {
+                const cell = cells[i];
+                const labelNode = cell.previousElementSibling;
+                const label = (labelNode && labelNode.tagName === 'TH')
+                    ? String(labelNode.textContent || '').replace(/\s+/g, ' ').trim()
+                    : '';
+                const personLinks = cell.querySelectorAll('a[href*="person_id="]');
+                if (personLinks.length > 0) {
+                    for (let l = 0; l < personLinks.length; l++) {
+                        pushAuthor(personLinks[l].textContent, roleOf(label));
+                    }
+                    continue;
+                }
+                if (/^(画|イラスト|作画|著|作者|作)$/.test(label)) {
+                    pushAuthor(textOf(cell), roleOf(label));
+                }
+            }
+        }
+
+        // 简介：「備考」h3 后第一个 div 内的 p 文本
+        const headings = doc.querySelectorAll('h3');
+        for (let h = 0; h < headings.length; h++) {
+            if (String(headings[h].textContent || '').replace(/\s+/g, ' ').trim() !== '備考') continue;
+            const wrap = headings[h].nextElementSibling;
+            if (wrap && wrap.tagName === 'DIV') {
+                const p = wrap.querySelector('p');
+                if (p) result.summary = textOf(p);
+            }
+            break;
+        }
+
+        return result;
+    }
+
     function buildSurugayaBlockedError(reason, detail) {
         const err = new Error(detail || '駿河屋 请求失败');
         err.surugayaBlocked = reason;
@@ -3077,6 +3174,54 @@
         if (bridged) return bridged;
 
         throw buildSurugayaBlockedError('cloudflare');
+    }
+
+    /**
+     * 取駿河屋商品详情页 HTML（选中结果后的补全抓取，best-effort）。
+     * 与搜索页同款两段式：先直连（浏览器 Cookie 罐 + 真实 UA，单次 15 秒），
+     * 403 / 「Just a moment」时按设置开关改用桥接标签页重取（onChallenge 提示用户切过去）；
+     * 两条路都失败（含关闭桥接开关）返回 ''，绝不抛错 —— 调用方静默退回列表页数据。
+     */
+    async function fetchSurugayaDetail(url, debug, onChallenge) {
+        try {
+            const skipDirect = Date.now() < surugayaDirectBlockedUntil;
+            if (skipDirect && debug) console.log('[KomgaScraper] [Suruga-ya] 详情直连刚被 Cloudflare 拦下过，本次直接走桥接标签页');
+
+            let response = { status: 0, raw: '' };
+            if (!skipDirect) {
+                const surugayaOptions = await surugayaRequestOptions();
+
+                response = await fetchWithRateLimit({
+                    method: 'GET',
+                    url: url,
+                    headers: surugayaOptions.headers,
+                    useBrowserUserAgent: true,
+                    anonymous: surugayaOptions.anonymous,
+                    timeout: 15000
+                });
+
+                if (debug) console.log('[KomgaScraper] [Suruga-ya] 详情页 Response status:', response.status);
+            }
+
+            const body = response.raw || '';
+            // Cloudflare 校验页既可能是 403，也可能是 200（标题固定 Just a moment...）
+            const challenged = skipDirect || response.status === 403 || /<title[^>]*>\s*Just a moment/i.test(body);
+            if (!challenged) {
+                if (response.status === 200 && body) return body;
+                if (debug) console.warn('[KomgaScraper] [Suruga-ya] 详情页请求失败（HTTP ' + response.status + '），退回列表页数据');
+                return '';
+            }
+
+            if (getConfig().surugayaBridgeTab === false || !surugayaBridgeSupported()) return '';
+
+            surugayaDirectBlockedUntil = Date.now() + SURUGAYA_DIRECT_BLOCK_COOLDOWN_MS;
+            if (debug) console.log('[KomgaScraper] [Suruga-ya] 详情直连被 Cloudflare 拦下，改用桥接标签页重取');
+            const bridged = await fetchSurugayaViaBridge(url, debug, onChallenge);
+            return bridged || '';
+        } catch (e) {
+            if (debug) console.warn('[KomgaScraper] [Suruga-ya] 详情页抓取失败，退回列表页数据:', e);
+            return '';
+        }
     }
 
     /** 返回 { results, total }；被 Cloudflare 拦下时抛出带 surugayaBlocked 标记的错误 */
@@ -3355,15 +3500,26 @@
             const image = extractMetaContent(html, 'og:image');
             const description = extractMetaContent(html, 'og:description');
 
-            let author = '';
             let publisher = '';
             let releaseDate = '';
             let category = '';
             const tags = [];
+            // 作家收集（v1.2.15 起全收）：作家字段可能渲染多枚标签芯片（合同本 / 选集实测 11 位），
+            // 旧代码只取第一枚导致「11 位作家只取第 1 位」；这里逐枚收集、按名去重、各自一条。
+            const authors = [];
+            const seenAuthors = {};
+            const pushAuthor = function(name) {
+                const clean = String(name || '').replace(/\s+/g, ' ').trim();
+                if (!clean || seenAuthors[clean]) return;
+                seenAuthors[clean] = true;
+                authors.push({ name: clean, role: 'writer' });
+            };
 
             if (doc) {
-                const authorNode = doc.querySelector('[data-testid="volume-detail-info-author"]');
-                if (authorNode) author = String(authorNode.textContent || '').replace(/\s+/g, ' ').trim();
+                const authorNodes = doc.querySelectorAll('[data-testid="volume-detail-info-author"]');
+                for (let i = 0; i < authorNodes.length; i++) {
+                    pushAuthor(String(authorNodes[i].textContent || ''));
+                }
 
                 const dateNode = doc.querySelector('[data-testid="volume-detail-info-content-publish-date"]');
                 if (dateNode) {
@@ -3400,7 +3556,7 @@
                 console.log('[KomgaScraper] [Fanza-Books] Parsed detail:', {
                     title: title,
                     releaseDate: releaseDate,
-                    author: author,
+                    authors: authors,
                     publisher: publisher,
                     category: category,
                     tags: tags,
@@ -3423,7 +3579,7 @@
                 date: releaseDate,
                 releaseDate: releaseDate,
                 pages: '',
-                authors: author ? [{ name: author, role: 'writer' }] : [],
+                authors: authors,
                 publisher: publisher,
                 ageRating: ageRating,
                 tags: tags,
@@ -3655,7 +3811,8 @@
      *   · title       ← work_name
      *   · summary     ← intro_s（官方短简介，压缩空白）
      *   · releaseDate ← regist_date 的 YYYY-MM-DD
-     *   · authors     ← authors（书籍系，author_name）∪ creaters（同人系各角色 name），统一 role=writer
+     *   · authors     ← authors（书籍系，author_name）∪ creaters（同人系各角色 name）；
+     *                   插画师（illust_by）→ artist（预览显示「作画」），声優（voice_by）不收集，其余 role=writer
      *   · publisher   ← maker_name（出版社 / サークル；取不到时回退 label_name）
      *   · tags        ← genres[].name（沿用 FANZA_TAG_BLOCKLIST 过滤 + 去重）
      *   · ageRating   ← age_category_string 为 adult（或 age_category >= 3）时判 18 禁
@@ -3671,21 +3828,24 @@
 
         const authors = [];
         const seenAuthors = {};
-        const pushAuthor = function(name) {
+        const pushAuthor = function(name, role) {
             const clean = String(name || '').replace(/\s+/g, ' ').trim();
             if (!clean || seenAuthors[clean]) return;
             seenAuthors[clean] = true;
-            authors.push({ name: clean, role: 'writer' });
+            authors.push({ name: clean, role: role || 'writer' });
         };
         // 书籍系（BJ）：authors（单作者是对象、多作者是数组，字段 author_name）
         dlsiteList(product.authors).forEach(function(entry) {
-            if (entry) pushAuthor(entry.author_name);
+            if (entry) pushAuthor(entry.author_name, 'writer');
         });
-        // 同人系（RJ）：creaters 是「角色 → 条目数组」的对象（author / illustration / voice_by …）
+        // 同人系（RJ）：creaters 是「角色 → 条目数组」的对象（created_by / scenario_by / illust_by / voice_by …）；
+        // 插画师（illust_by）按「作画」记 artist；声優（voice_by）不是作者、不收集（Komga 这里只收录漫画）
         if (product.creaters && typeof product.creaters === 'object') {
             Object.keys(product.creaters).forEach(function(roleKey) {
+                if (roleKey === 'voice_by') return;
+                const role = roleKey === 'illust_by' ? 'artist' : 'writer';
                 dlsiteList(product.creaters[roleKey]).forEach(function(entry) {
-                    if (entry) pushAuthor(entry.name);
+                    if (entry) pushAuthor(entry.name, role);
                 });
             });
         }
@@ -5828,8 +5988,26 @@
                 let detail = null;
                 const selectedSource = selectedResult && selectedResult.source ? selectedResult.source : source;
                 if (selectedSource === 'surugaya') {
-                    // 駿河屋 搜索列表页已含全部可用字段，不用再抓（且详情页有 Cloudflare 校验）
-                    detail = selectedResult;
+                    // 駿河屋 列表页作者不全（只列前两位）且没有简介：选中后补抓商品详情页（v1.2.15 起）。
+                    // 直连被 Cloudflare 拦下会自动开桥接标签页；任何失败都静默退回列表页数据（不弹错）。
+                    detail = Object.assign({}, selectedResult);
+                    try {
+                        const surugayaDetailHtml = await withTimeout(
+                            fetchSurugayaDetail(selectedResult.url, getConfig().debug, function() {
+                                showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证，脚本会自动继续');
+                            }),
+                            SURUGAYA_BRIDGE_TIMEOUT_MS + 5000,
+                            '駿河屋 详情'
+                        );
+                        if (surugayaDetailHtml) {
+                            const surugayaDetailInfo = parseSurugayaDetailInfo(surugayaDetailHtml);
+                            if (surugayaDetailInfo.authors.length > 0) detail.authors = surugayaDetailInfo.authors;
+                            if (surugayaDetailInfo.summary) detail.summary = surugayaDetailInfo.summary;
+                            if (getConfig().debug) console.log('[KomgaScraper] [Suruga-ya] 详情页补全：作者', surugayaDetailInfo.authors.length, '位 / 简介', surugayaDetailInfo.summary ? '已取到' : '缺失');
+                        }
+                    } catch (surugayaDetailErr) {
+                        console.warn('[KomgaScraper] [Suruga-ya] 详情页补全失败，继续用搜索结果:', surugayaDetailErr);
+                    }
                 } else {
                     let detailPromise;
                     if (selectedSource === 'fanza-books') {
