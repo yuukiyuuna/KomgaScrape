@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.15
+// @version      1.2.16
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和「同人本搜索」手动刮削（FANZAブックス → DLsite → FANZA同人 → 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
@@ -82,8 +82,9 @@
     const SURUGAYA_BRIDGE_REQUEST_KEY = 'komga_scraper_surugaya_bridge_request';
     const SURUGAYA_BRIDGE_RESULT_KEY = 'komga_scraper_surugaya_bridge_result';
     const SURUGAYA_BRIDGE_REQUEST_TTL_MS = 120000;  // 请求记录有效期，超过即视为上一次的残留
-    const SURUGAYA_BRIDGE_CHILD_MAX_MS = 90000;     // 桥接页最多等多久页面就绪
-    const SURUGAYA_BRIDGE_TIMEOUT_MS = 100000;      // Komga 页最多等多久结果（要大于子页上限）
+    // 桥接等待上限（Komga 页等结果 / 桥接页等页面就绪共用；全脚本唯一写死的超时：
+    // 直连一律按设置的「单个搜索源超时」，只有桥接要额外留出用户完成人机验证的时间）
+    const SURUGAYA_BRIDGE_WAIT_MS = 40000;
     // Cloudflare 校验页的标题（英文站 / 日文站都覆盖），用来识别「还没过校验」
     const SURUGAYA_BRIDGE_CHALLENGE_RE = /Just a moment|Attention Required|しばらくお待ちください|確認中/;
 
@@ -145,7 +146,7 @@
                 challengeNotified = true;
                 postSurugayaBridgeResult({ id: request.id, phase: 'challenge' });
                 return;
-            } else if (Date.now() - startedAt > SURUGAYA_BRIDGE_CHILD_MAX_MS) {
+            } else if (Date.now() - startedAt > SURUGAYA_BRIDGE_WAIT_MS) {
                 result = { id: request.id, ok: false, reason: 'timeout' };
             }
             if (!result) return;
@@ -182,7 +183,10 @@
     let surugayaBridgePending = null;   // { urlKey, promise, challengeCallbacks }
 
     /**
-     * Komga 页侧：开一个真实标签页去取 url 的 HTML，成功返回 HTML 字符串，失败返回 ''。
+     * Komga 页侧：开一个真实标签页去取 url 的 HTML。
+     * · 成功返回 HTML 字符串；桥接页报错 / 打开标签页失败返回 ''（调用方按原 Cloudflare 拦截语义提示）；
+     * · 等满 SURUGAYA_BRIDGE_WAIT_MS（40 秒，含用户完成人机验证的时间）仍未取到结果时，
+     *   以带 surugayaBlocked='bridge-timeout' 标记的错误拒绝（不再静默 resolve ''，避免与「被拦」混淆）。
      * onChallenge 会在「桥接页停在人机校验页」时被调用一次，用于提示用户去点确认。
      */
     function fetchSurugayaViaBridge(url, debug, onChallenge) {
@@ -203,22 +207,22 @@
             }
             // 不同 URL：等前一个桥接落定后再发起（避免两个标签页互相覆盖请求记录）
             if (debug) console.log('[KomgaScraper] 已有桥接标签页在处理其它页面，排队等它结束后再发起:', url);
-            return pending.promise.then(function() {
+            const queued = function() {
                 return fetchSurugayaViaBridge(url, debug, onChallenge);
-            });
+            };
+            // 前一个桥接无论成功还是失败（含 40 秒超时拒绝），都不阻塞后续排队的请求
+            return pending.promise.then(queued, queued);
         }
 
         const challengeCallbacks = typeof onChallenge === 'function' ? [onChallenge] : [];
 
-        const promise = new Promise(function(resolve) {
+        const promise = new Promise(function(resolve, reject) {
             const id = 'sg' + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
             let settled = false;
             let listenerId = null;
             let tab = null;
 
-            const finish = function(html) {
-                if (settled) return;
-                settled = true;
+            const cleanup = function() {
                 clearTimeout(timer);
                 if (listenerId !== null && typeof GM_removeValueChangeListener === 'function') {
                     try { GM_removeValueChangeListener(listenerId); } catch (e) { }
@@ -227,13 +231,26 @@
                 if (tab && typeof tab.close === 'function') {
                     try { tab.close(); } catch (e) { }
                 }
+            };
+
+            const finish = function(html) {
+                if (settled) return;
+                settled = true;
+                cleanup();
                 resolve(html || '');
             };
 
+            const fail = function(err) {
+                if (settled) return;
+                settled = true;
+                cleanup();
+                reject(err);
+            };
+
             const timer = setTimeout(function() {
-                if (debug) console.warn('[KomgaScraper] 桥接标签页超时，未取到结果');
-                finish('');
-            }, SURUGAYA_BRIDGE_TIMEOUT_MS);
+                if (debug) console.warn('[KomgaScraper] 桥接标签页等待超时（' + Math.round(SURUGAYA_BRIDGE_WAIT_MS / 1000) + ' 秒），未取到结果');
+                fail(buildSurugayaBlockedError('bridge-timeout', '駿河屋 人机验证未在 ' + Math.round(SURUGAYA_BRIDGE_WAIT_MS / 1000) + ' 秒内完成'));
+            }, SURUGAYA_BRIDGE_WAIT_MS);
 
             listenerId = GM_addValueChangeListener(SURUGAYA_BRIDGE_RESULT_KEY, function(name, oldValue, newValue) {
                 if (!newValue || newValue.id !== id) return;
@@ -332,8 +349,9 @@
         // 嵌套对象的默认值无法自动补齐，放在子对象里会导致旧配置读不到默认值）
         searchFetchLimit: 50,      // 单次拉取条数（旧版降级接口硬上限 25）
         searchVisibleCount: 10,    // 弹窗默认显示条数，0 表示显示全部
-        // 单个搜索源（含 Bangumi）最长等待秒数（3–30）：超时即跳过该源、继续链路；
-        // 点选结果后的详情抓取固定 15 秒限时，不跟随此值
+        // 单个搜索源（含 Bangumi 与 駿河屋 直连搜索/详情）最长等待秒数（3–30）：超时即跳过该源、继续链路；
+        // 駿河屋 被 Cloudflare 拦下后转桥接标签页，桥接固定等 40 秒（SURUGAYA_BRIDGE_WAIT_MS，不受此值影响）；
+        // 其余源点选结果后的详情抓取固定 15 秒限时，不跟随此值
         searchSourceTimeoutSec: 10,
         // 駿河屋 直连被 Cloudflare 拦下时，是否自动改用「桥接标签页」重取（见文件顶部模块 0）
         surugayaBridgeTab: true
@@ -2979,11 +2997,22 @@
             const dateNode = node.querySelector('p.release_date');
             const releaseDate = dateNode ? extractSurugayaReleaseDate(dateNode.textContent) : '';
 
-            const imgNode = node.querySelector('.photo_box img') || node.querySelector('img[src*="photo.php"]');
-            let image = imgNode ? String(imgNode.getAttribute('src') || '').trim() : '';
+            // 图片取值优先级：src → data-src → data-original（涵盖懒加载写法），再兜底找 photo.php 缩略图；
+            // 保持列表页原生 size=m（v1.2.16：此前改写为 size=l 会被站内 CDN 拒绝，卡片反而不显示封面）
+            const imgNode = node.querySelector('.photo_box img')
+                || node.querySelector('img[src*="photo.php"]')
+                || node.querySelector('img[data-src*="photo.php"]')
+                || node.querySelector('img[data-original*="photo.php"]');
+            let image = '';
+            if (imgNode) {
+                image = String(
+                    imgNode.getAttribute('src')
+                    || imgNode.getAttribute('data-src')
+                    || imgNode.getAttribute('data-original')
+                    || ''
+                ).trim();
+            }
             if (image.indexOf('//') === 0) image = 'https:' + image;
-            // 列表缩略图是 size=m，换成 size=l 拿更大的封面
-            image = image.replace(/([?&]size=)m\b/, '$1l');
 
             // 年龄分级：駿河屋 用分类标签 + r18.png 图标标注限制级商品
             // （实测标签如「男性向18禁同人誌」「女性向けアダルト同人誌（BL含む）」「インディーズアダルトDVD」；
@@ -3119,14 +3148,19 @@
                 + '可只让 suruga-ya.jp 走代理 / 代理软件规则换出口 IP 后重试（换 IP 后校验会重新触发一次，属正常现象）。';
             return message;
         }
+        if (reason === 'bridge-timeout') {
+            return '駿河屋 人机验证未在 40 秒内完成（超过 40 秒未取到结果）。请重试，并在打开桥接标签页后 40 秒内切过去点一下「确认」，脚本会自动继续。';
+        }
         if (reason === 'parse') return '駿河屋 结果页结构可能已变更（未解析到任何商品）';
         return '请检查网络连接后重试';
     }
 
     /**
      * 取駿河屋搜索页 HTML。
-     * 1) 先直连：GM_xmlhttpRequest + 浏览器 Cookie 罐里的校验 Cookie（干净 IP 下这一步就够了）；
-     * 2) 被判为人机校验（403 / Just a moment）时，改用「桥接标签页」重取（见文件顶部模块 0）。
+     * 1) 先直连：GM_xmlhttpRequest + 浏览器 Cookie 罐里的校验 Cookie（干净 IP 下这一步就够了），
+     *    按设置的「单个搜索源超时」限时（与其它直连源同一口径）；
+     * 2) 被判为人机校验（403 / Just a moment）时，改用「桥接标签页」重取（见文件顶部模块 0），
+     *    桥接是独立的一段预算：固定等 40 秒（含用户完成人机验证的时间），不与直连共用总限时。
      * 两条路都失败时抛出带 surugayaBlocked 标记的错误。
      */
     async function fetchSurugayaSearchHtml(searchUrl, debug) {
@@ -3137,13 +3171,14 @@
         if (!skipDirect) {
             const surugayaOptions = await surugayaRequestOptions();
 
-            response = await fetchWithRateLimit({
+            // 软限时：到点直接按「超时：超过 X 秒未响应」跳出（请求本身不 abort），与其它源口径一致
+            response = await withTimeout(fetchWithRateLimit({
                 method: 'GET',
                 url: searchUrl,
                 headers: surugayaOptions.headers,
                 useBrowserUserAgent: true,
                 anonymous: surugayaOptions.anonymous
-            });
+            }), getSearchSourceTimeoutMs(), '駿河屋');
 
             if (debug) console.log('[KomgaScraper] [Suruga-ya] Response status:', response.status);
         }
@@ -3168,9 +3203,19 @@
 
         surugayaDirectBlockedUntil = Date.now() + SURUGAYA_DIRECT_BLOCK_COOLDOWN_MS;
         if (debug) console.log('[KomgaScraper] [Suruga-ya] 直连被 Cloudflare 拦下，改用桥接标签页重取');
-        const bridged = await fetchSurugayaViaBridge(searchUrl, debug, function() {
-            showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证，脚本会自动继续');
-        });
+        // 直连与桥接两段独立预算：这里最多等 SURUGAYA_BRIDGE_WAIT_MS（40 秒，含用户完成人机验证的时间），
+        // 不再沿用直连阶段被消耗掉的单源超时（此前桥接会被 10 秒总预算误判超时）
+        let bridged = '';
+        try {
+            bridged = await fetchSurugayaViaBridge(searchUrl, debug, function() {
+                showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证（请在 40 秒内完成验证），脚本会自动继续');
+            });
+        } catch (bridgeErr) {
+            // 人机验证超时：如实提示用户重试；其它桥接故障仍按「被拦」提示
+            if (bridgeErr && bridgeErr.surugayaBlocked === 'bridge-timeout') throw bridgeErr;
+            if (debug) console.warn('[KomgaScraper] [Suruga-ya] 桥接取回失败，按被拦处理:', bridgeErr);
+            throw buildSurugayaBlockedError('cloudflare');
+        }
         if (bridged) return bridged;
 
         throw buildSurugayaBlockedError('cloudflare');
@@ -3178,9 +3223,10 @@
 
     /**
      * 取駿河屋商品详情页 HTML（选中结果后的补全抓取，best-effort）。
-     * 与搜索页同款两段式：先直连（浏览器 Cookie 罐 + 真实 UA，单次 15 秒），
-     * 403 / 「Just a moment」时按设置开关改用桥接标签页重取（onChallenge 提示用户切过去）；
-     * 两条路都失败（含关闭桥接开关）返回 ''，绝不抛错 —— 调用方静默退回列表页数据。
+     * 与搜索页同款两段式：先直连（浏览器 Cookie 罐 + 真实 UA，单次按「单个搜索源超时」设置秒数限时，
+     * v1.2.16 起与搜索直连同口径、原为固定 15 秒），
+     * 403 / 「Just a moment」时按设置开关改用桥接标签页重取（onChallenge 提示用户切过去，桥接固定等 40 秒）；
+     * 两条路都失败（含关闭桥接开关 / 桥接超时）返回 ''，绝不抛错 —— 调用方静默退回列表页数据。
      */
     async function fetchSurugayaDetail(url, debug, onChallenge) {
         try {
@@ -3197,7 +3243,7 @@
                     headers: surugayaOptions.headers,
                     useBrowserUserAgent: true,
                     anonymous: surugayaOptions.anonymous,
-                    timeout: 15000
+                    timeout: getSearchSourceTimeoutMs()
                 });
 
                 if (debug) console.log('[KomgaScraper] [Suruga-ya] 详情页 Response status:', response.status);
@@ -3244,6 +3290,7 @@
 
         const total = extractSurugayaSearchTotal(html);
         if (debug) console.log('[KomgaScraper] [Suruga-ya] Parsed', items.length, 'items / total:', total);
+        if (debug && items.length > 0) console.log('[KomgaScraper] [Suruga-ya] 首条结果图片 URL:', items[0].image || '(空)');
 
         return { results: items, total: total };
     }
@@ -4503,7 +4550,15 @@
                 if (imgUrl.indexOf('//') === 0) {
                     imgUrl = 'https:' + imgUrl;
                 } else if (imgUrl.indexOf('http') !== 0 && imgUrl.indexOf('/') === 0) {
-                    imgUrl = 'https://www.dmm.co.jp' + imgUrl;
+                    // 相对地址按结果自身来源站补全（此前硬拼 www.dmm.co.jp，
+                    // 駿河屋 / DLsite 等其它源的相对图地址会被拼错）
+                    let origin = '';
+                    try {
+                        origin = new URL(String(result.url || ''), location.href).origin;
+                    } catch (e) {
+                        origin = '';
+                    }
+                    imgUrl = (origin || 'https://www.dmm.co.jp') + imgUrl;
                 }
                 safeImage = imgUrl.replace(/"/g, '&quot;');
             }
@@ -4759,7 +4814,7 @@
 
             doujinSwitching = true;
             doujinSearchingLabel = target.label;
-            doujinSwitchDeadline = Date.now() + doujinSourceSearchBudgetMs(target, reqKeyword, true) + 2000;
+            doujinSwitchDeadline = Date.now() + doujinSourceSearchBudgetMs(target, reqKeyword) + 2000;
             doujinSearchedAny = true;
             setDoujinChipsDisabled(true);
             // 保留切换前的列表数据，失败时原样恢复
@@ -5668,8 +5723,9 @@
         { key: 'surugaya', label: '駿河屋', search: searchSurugaYa }
     ];
 
-    // 点选结果后的详情抓取固定限时：超时 → 走既有「获取详情失败，将使用搜索结果」降级
-    // （不跟随 searchSourceTimeoutSec 配置，自动刮削路径不受影响）
+    // 其余源点选结果后的详情抓取固定限时：超时 → 走既有「获取详情失败，将使用搜索结果」降级
+    // （不跟随 searchSourceTimeoutSec 配置，自动刮削路径不受影响；
+    //   仅 駿河屋 例外：详情直连与桥接各走自己的预算，见 surugayaSourceBudgetMs）
     const DETAIL_FETCH_TIMEOUT_MS = 15000;
 
     /**
@@ -5702,32 +5758,37 @@
     }
 
     /**
+     * 駿河屋 单源搜索的本次预算（毫秒）：直连（设置值）+ 桥接等待 40 秒 + 5 秒宽限。
+     * 直连与桥接是两段独立预算（桥接含用户完成人机验证的时间），不再叠加成一段总限时。
+     */
+    function surugayaSourceBudgetMs() {
+        return getSearchSourceTimeoutMs() + SURUGAYA_BRIDGE_WAIT_MS + 5000;
+    }
+
+    /**
      * 「同人本单源搜索」的本次预算（毫秒）：
-     * · 駿河屋 弹窗手动搜索要等「人机验证桥接」完成，超时放宽到桥接上限 + 5 秒（链路内仍按配置严格限时）；
+     * · 駿河屋 直连按设置的「单个搜索源超时」限时，被拦后还有一次 40 秒的桥接等待 → 走 surugayaSourceBudgetMs；
      * · 其余源 0 命中时可能依次重试圆形字符变体，每个变体各占一份单源超时。
      * 供弹窗看门狗与 searchDoujinSourceWithVariants 计算超时使用。
      */
-    function doujinSourceSearchBudgetMs(src, keyword, manual) {
+    function doujinSourceSearchBudgetMs(src, keyword) {
         // 与 searchDoujinSourceWithVariants 内的超时口径保持一致：
         // 駿河屋只发一次请求（无变体）；其余源最坏情况 = 原词 + 全部变体各一次。
-        const perAttemptMs = (manual && src && src.key === 'surugaya')
-            ? Math.max(getSearchSourceTimeoutMs(), SURUGAYA_BRIDGE_TIMEOUT_MS + 5000)
-            : getSearchSourceTimeoutMs();
-        if (src && src.key === 'surugaya') return perAttemptMs;
-        return perAttemptMs * (1 + circleKeywordVariants(keyword).length);
+        if (src && src.key === 'surugaya') return surugayaSourceBudgetMs();
+        return getSearchSourceTimeoutMs() * (1 + circleKeywordVariants(keyword).length);
     }
 
     /**
      * 同人本单源搜索（含圆形字符变体重试）：
      * · 先按原关键词搜；仅当「请求成功且 0 条」时才依次换成 〇/◯/○ 写法重试，命中即停；
      * · 请求失败（被拦 / 解析失败 / 超时）不重试，原样上抛（保持链路与弹窗的错误提示语义）；
-     * · 駿河屋 是模糊匹配、不做变体；弹窗手动搜索时超时放宽到桥接预算（等用户完成人机验证）。
+     * · 駿河屋 是模糊匹配、不做变体；超时预算单独走 surugayaSourceBudgetMs（直连设置值 + 桥接 40 秒），
+     *   弹窗手动与四源链路同口径（v1.2.16 起不再有 105 秒档）。
      */
     async function searchDoujinSourceWithVariants(src, keyword, opts) {
         const manual = !!(opts && opts.manual);
-        const perAttemptMs = (manual && src.key === 'surugaya')
-            ? Math.max(getSearchSourceTimeoutMs(), SURUGAYA_BRIDGE_TIMEOUT_MS + 5000)
-            : getSearchSourceTimeoutMs();
+        // 駿河屋：直连 + 桥接两段预算；其余源：每个变体各占一份单源超时
+        const perAttemptMs = src.key === 'surugaya' ? surugayaSourceBudgetMs() : getSearchSourceTimeoutMs();
         const debug = getConfig().debug;
         const startedAt = Date.now();
         if (debug) console.log('[KomgaScraper] [' + src.label + '] 单源搜索开始：', keyword, manual ? '（弹窗手动）' : '（四源链路）');
@@ -5994,9 +6055,9 @@
                     try {
                         const surugayaDetailHtml = await withTimeout(
                             fetchSurugayaDetail(selectedResult.url, getConfig().debug, function() {
-                                showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证，脚本会自动继续');
+                                showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证（请在 40 秒内完成验证），脚本会自动继续');
                             }),
-                            SURUGAYA_BRIDGE_TIMEOUT_MS + 5000,
+                            surugayaSourceBudgetMs(),
                             '駿河屋 详情'
                         );
                         if (surugayaDetailHtml) {
@@ -6022,7 +6083,7 @@
                     } else {
                         detailPromise = fetchSubjectDetail(selectedResult.id);
                     }
-                    // 详情抓取固定 15 秒限时：超时 / 请求失败都降级为「使用搜索结果」（见下方 !detail 分支）
+                    // 其余源详情抓取固定 15 秒限时：超时 / 请求失败都降级为「使用搜索结果」（见下方 !detail 分支）
                     try {
                         detail = await withTimeout(detailPromise, DETAIL_FETCH_TIMEOUT_MS, '获取详细数据');
                     } catch (detailErr) {
