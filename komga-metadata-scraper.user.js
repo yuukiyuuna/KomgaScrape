@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.16
+// @version      1.2.17
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和「同人本搜索」手动刮削（FANZAブックス → DLsite → FANZA同人 → 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
@@ -2963,6 +2963,28 @@
         return /検索結果は０件です/.test(String(html || ''));
     }
 
+    /**
+     * 列表页缩略图（photo.php）→ 可跨站嵌入的 CDN 原图 URL（v1.2.17 起）。
+     * 背景：photo.php 挂在 Cloudflare 后（403 + Cross-Origin-Resource-Policy: same-origin），
+     * 从 Komga 页面直接引用必被浏览器拦下（ERR_BLOCKED_BY_RESPONSE.NotSameOrigin）；
+     * cdn.suruga-ya.jp 无挑战、无 CORP 限制，实测可正常嵌入。解析不出 shinaban 时返回 ''。
+     */
+    function surugayaCdnImageUrl(photoUrl) {
+        const match = /[?&]shinaban=([A-Za-z0-9]+)/.exec(String(photoUrl || ''));
+        if (!match) return '';
+        return 'https://cdn.suruga-ya.jp/database/pics/game/' + match[1].toLowerCase() + '.jpg';
+    }
+
+    /**
+     * boxart 小图（pics.suruga-ya.jp，同样可跨站嵌入）：仅数字型 shinaban 有该规格
+     * （实测 984907335 可用、字母型 ZHORO49041 404）；作为最后的图片回退。
+     */
+    function surugayaBoxartImageUrl(photoUrl) {
+        const match = /[?&]shinaban=([A-Za-z0-9]+)/.exec(String(photoUrl || ''));
+        if (!match || !/^\d+$/.test(match[1])) return '';
+        return 'https://pics.suruga-ya.jp/pics/boxart_ss/' + match[1] + 'ss.gif';
+    }
+
     /** 解析駿河屋搜索列表页（div.item），返回结果数组；页面结构不认返回 null */
     function parseSurugayaSearchItems(html) {
         const doc = parseHtmlToDoc(html);
@@ -3014,6 +3036,14 @@
             }
             if (image.indexOf('//') === 0) image = 'https:' + image;
 
+            // v1.2.17：展示主图改用 CDN 直链（photo.php 从 Komga 页面跨站引用必被
+            // Cloudflare 挑战 + CORP 拦下）；photo.php 与数字 ID 的 boxart 小图仅作降级回退
+            const photoImage = image;
+            const cdnImage = surugayaCdnImageUrl(photoImage);
+            if (cdnImage) image = cdnImage;
+            const imageFallback = cdnImage ? photoImage : '';
+            const imageFallback2 = surugayaBoxartImageUrl(photoImage);
+
             // 年龄分级：駿河屋 用分类标签 + r18.png 图标标注限制级商品
             // （实测标签如「男性向18禁同人誌」「女性向けアダルト同人誌（BL含む）」「インディーズアダルトDVD」；
             //   非限制级商品不带该图标，对照实测无 r18 标记）
@@ -3036,6 +3066,9 @@
                 summary: '',
                 image: image,
                 largeImage: image,
+                // 渲染层 onerror 降级链用：CDN 失败 → photo.php → boxart（空串表示没有该回退）
+                imageFallback: imageFallback,
+                imageFallback2: imageFallback2,
                 publisher: name.circle,
                 ageRating: isAdultProduct ? ADULT_AGE_RATING : null,
                 releaseDate: releaseDate,
@@ -4562,6 +4595,9 @@
                 }
                 safeImage = imgUrl.replace(/"/g, '&quot;');
             }
+            // v1.2.17：駿河屋 封面的跨站降级链（CDN → photo.php → boxart）；其它源为空串、行为不变
+            const safeImageFallback = String(result.imageFallback || '').replace(/"/g, '&quot;');
+            const safeImageFallback2 = String(result.imageFallback2 || '').replace(/"/g, '&quot;');
             const safeTitle = String(result.title || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
             const safeOriginal = String(result.originalTitle || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
             const safeSummary = String(result.summary || '').replace(/</g, '&lt;').replace(/"/g, '&quot;').substring(0, 120);
@@ -4580,7 +4616,7 @@
                 <div class="ks-result-card" data-index="${index}" style="background:rgba(255,255,255,0.05);border-radius:12px;padding:12px;margin-bottom:10px;border:1px solid rgba(255,255,255,0.08);cursor:pointer;transition:all 0.3s ease;">
                     <div style="display:flex;gap:12px;">
                         ${safeImage ? `
-                            <img src="${safeImage}" alt="" referrerpolicy="no-referrer" onerror="this.style.display='none'" style="width:60px;height:80px;object-fit:cover;border-radius:6px;flex-shrink:0;">
+                            <img src="${safeImage}" data-fb1="${safeImageFallback}" data-fb2="${safeImageFallback2}" alt="" referrerpolicy="no-referrer" onerror="if(this.dataset.fb1){this.src=this.dataset.fb1;this.removeAttribute('data-fb1');}else if(this.dataset.fb2){this.src=this.dataset.fb2;this.removeAttribute('data-fb2');}else{this.style.display='none';}" style="width:60px;height:80px;object-fit:cover;border-radius:6px;flex-shrink:0;">
                         ` : `
                             <div style="width:60px;height:80px;background:rgba(255,255,255,0.05);border-radius:6px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.3);font-size:24px;flex-shrink:0;">📚</div>
                         `}
@@ -5320,6 +5356,8 @@
         let previewHtml = '<div style="padding:4px 0;">';
 
         const safeLargeImage = (scrapeResult.largeImage || scrapeResult.image || '').replace(/"/g, '&quot;');
+        const safeLargeImageFallback = String(scrapeResult.imageFallback || '').replace(/"/g, '&quot;');
+        const safeLargeImageFallback2 = String(scrapeResult.imageFallback2 || '').replace(/"/g, '&quot;');
         const safeTitle = String(scrapeResult.title || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
         const safeOriginal = String(scrapeResult.originalTitle || '').replace(/</g, '&lt;').replace(/"/g, '&quot;');
         const safeUrl = String(scrapeResult.url || '#').replace(/"/g, '&quot;');
@@ -5328,7 +5366,7 @@
             <div style="background:rgba(255,255,255,0.05);border-radius:12px;padding:12px;margin-bottom:20px;border:1px solid rgba(255,255,255,0.08);">
                 <div style="display:flex;gap:12px;align-items:flex-start;">
                     ${safeLargeImage ? `
-                        <img src="${safeLargeImage}" alt="" referrerpolicy="no-referrer" onerror="this.style.display='none'" style="width:80px;height:110px;object-fit:cover;border-radius:8px;flex-shrink:0;">
+                        <img src="${safeLargeImage}" data-fb1="${safeLargeImageFallback}" data-fb2="${safeLargeImageFallback2}" alt="" referrerpolicy="no-referrer" onerror="if(this.dataset.fb1){this.src=this.dataset.fb1;this.removeAttribute('data-fb1');}else if(this.dataset.fb2){this.src=this.dataset.fb2;this.removeAttribute('data-fb2');}else{this.style.display='none';}" style="width:80px;height:110px;object-fit:cover;border-radius:8px;flex-shrink:0;">
                     ` : `
                         <div style="width:80px;height:110px;background:rgba(255,255,255,0.05);border-radius:8px;display:flex;align-items:center;justify-content:center;color:rgba(255,255,255,0.3);font-size:32px;flex-shrink:0;">📚</div>
                     `}
