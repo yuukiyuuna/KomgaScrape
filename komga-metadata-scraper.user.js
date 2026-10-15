@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.13
+// @version      1.2.14
 // @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和「同人本搜索」手动刮削（FANZAブックス → DLsite → FANZA同人 → 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
@@ -2276,7 +2276,11 @@
     // 駿河屋（兜底源）：只取搜索列表页，不抓商品详情页
     // （/product/detail/* 有 Cloudflare 拦截，实测直连返回 403「Just a moment...」；
     //   列表页本身已含 作品名/作者/サークル/発売日/封面/商品链接，够用）
-    const SURUGAYA_SEARCH_URL = 'https://www.suruga-ya.jp/search?category=&search_word={keyword}&searchbox=1&adult_s=3';
+    // 注意：搜索 URL 里不要带 adult_s 参数。实测（2026-10）adult_s=3 会把检索范围限制成
+    //   「R18 商品子集」——非 R18 同人本（如 男性向一般同人誌）全名精确搜索也会返回 404 +
+    //   「検索結果は０件です」（实例：「嫌な顔されながらおパンツ見せてもらいたい合同本」）。
+    //   R18 条目的完整标题/链接由下方 SURUGAYA_COOKIE 的 safe_search_option=3 保证，不依赖该参数。
+    const SURUGAYA_SEARCH_URL = 'https://www.suruga-ya.jp/search?category=&search_word={keyword}&searchbox=1';
     // 18 禁条目在未确认年龄时标题与链接会被抹成空串；带上服务端下发的 safe_search_option 才能取到完整条目
     const SURUGAYA_COOKIE = 'safe_search_option=3; safe_search_expired=3';
     // 直连一旦被 Cloudflare 拦下，短时间内就别再试直连了（省掉每次注定失败的 403）；
