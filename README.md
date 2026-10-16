@@ -2,7 +2,7 @@
 
 一个用于 [Komga](https://komga.org/) 的用户脚本（Userscript），可以从外部数据源抓取漫画 / 书籍的元数据，并写回 Komga。
 
-当前版本：**v1.2.16**
+当前版本：**v1.2.17**
 
 ## 功能概览
 
@@ -224,6 +224,10 @@ Bangumi 的 v0 接口（`api.bgm.tv/v0/...`）偶尔会整段不可用（例如�
 - 駿河屋 全站都有 Cloudflare 人机校验（商品详情页必拦，搜索列表页在本机 IP 被判可疑时也会拦）。搜索用列表页数据，**v1.2.15 起选中结果后会自动补抓商品详情页**（补全作者与简介；详情页同样靠「桥接标签页」重取，失败静默退回列表页数据）。若直连与桥接都失败，可只让 `suruga-ya.jp` 走代理换出口 IP 后重试。DLsite 已不再使用桥接标签页：直连失败时请让 `www.dlsite.com` 走代理后重试（脚本不内置代理）。
 
 ## 更新日志
+
+### v1.2.17
+
+- **修正 v1.2.16 未生效的封面修复（真实根因）**：駿河屋 `photo.php` 缩略图挂在 Cloudflare 后——请求会被挑战（403），响应还带 `Cross-Origin-Resource-Policy: same-origin`，从 Komga 页面直接 `<img>` 引用必被浏览器拦下（`net::ERR_BLOCKED_BY_RESPONSE.NotSameOrigin`），与此前的 `size=m / size=l` 无关。现在卡片与预览弹窗的封面改用 **`cdn.suruga-ya.jp` 原图直链**（`/database/pics/game/{商品编号小写}.jpg`，无 Cloudflare 挑战、无 CORP 限制，实测可跨站嵌入），并加降级链：CDN → `photo.php` 缩略图 → 数字编号商品的 boxart 小图（`pics.suruga-ya.jp`）→ 隐藏。其它来源的图片渲染不受影响。
 
 ### v1.2.16
 
