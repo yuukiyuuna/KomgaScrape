@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      1.2.17
-// @description  Komga 漫画/书籍元数据抓取脚本：支持 Bangumi 和「同人本搜索」手动刮削（FANZAブックス → DLsite → FANZA同人 → 駿河屋 兜底）；支持系列级 Bangumi 自动刮削（按卷号匹配，自动加锁）
+// @version      2.0.0
+// @description  Komga 漫画/书籍元数据刮削。兼容 Next UI 和 Classic UI，支持 Bangumi 和同人本手动刮削，以及 Bangumi 系列自动刮削。
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
 // @grant        GM_xmlhttpRequest
@@ -426,29 +426,97 @@
     }
 
     // ============================================================
-    // 2. 页面检测模块
+    // 2. Komga 前端与详情路由
     // ============================================================
 
-    function getCurrentPageType() {
-        const path = window.location.pathname;
-        if (path.startsWith('/series/')) {
-            return 'series';
-        }
-        if (path.startsWith('/books/') || path.startsWith('/book/')) {
-            return 'book';
-        }
-        return 'other';
+    const komgaPageWindow = typeof unsafeWindow === 'undefined' ? window : unsafeWindow;
+
+    function getKomgaBasePath() {
+        const resourceBaseUrl = komgaPageWindow.resourceBaseUrl;
+        if (typeof resourceBaseUrl !== 'string' || !resourceBaseUrl.startsWith('/')) return '';
+
+        const base = new URL(resourceBaseUrl, window.location.origin);
+        return base.origin === window.location.origin ? base.pathname.replace(/\/+$/, '') : '';
     }
 
-    function extractIdFromUrl() {
+    const komgaUiAdapters = [{
+        name: 'next',
+        matches: function() {
+            // Next UI 的服务端入口用 buildUrl 加载打包资源。
+            return typeof komgaPageWindow.buildUrl === 'function' && !!document.getElementById('app');
+        },
+        detailPath: /^\/(?:next\/)?(series|book)\/([^/]+)\/?$/,
+        isDefault: function(settings) {
+            return settings.nextUiAsDefault === true;
+        },
+        findActionMount: function() {
+            // BookView / SeriesView 把原生操作区移动到当前宽度对应的挂载点。
+            const actionRow = document.querySelector(
+                '#app .v-main :is([id^="sm-"], [id^="xs-"]) > .v-container.px-0 > .v-row:first-child .d-flex.ga-2'
+            );
+            return actionRow ? actionRow.parentElement : null;
+        }
+    }];
+
+    // BEGIN CLASSIC UI
+    komgaUiAdapters.push({
+        name: 'classic',
+        matches: function() {
+            return typeof komgaPageWindow.buildUrl !== 'function'
+                && typeof komgaPageWindow.resourceBaseUrl === 'string'
+                && !!document.querySelector('#app, .v-application');
+        },
+        detailPath: /^\/(?:classic\/)?(series|books?)\/([^/]+)\/?$/,
+        isDefault: function(settings) {
+            // 早期 Komga 没有切换设置，默认前端为 Classic UI。
+            return settings.nextUiAsDefault !== true;
+        },
+        actionClass: 'col col-auto',
+        findActionMount: function(route) {
+            const resource = route.type === 'series' ? 'series' : 'books';
+            const filePath = komgaBasePath + '/api/v1/' + resource + '/' + encodeURIComponent(route.id) + '/file';
+            const downloadLinks = document.querySelectorAll('.v-main .row.align-center a.v-btn[href]');
+            for (const link of downloadLinks) {
+                if (link.origin === window.location.origin && link.pathname === filePath) {
+                    return link.closest('.row.align-center');
+                }
+            }
+
+            // 下载权限受限时，旧版仍显示禁用的原生下载按钮及图标。
+            const icon = document.querySelector('.v-main .row.align-center button.v-btn .mdi-file-download');
+            return icon ? icon.closest('.row.align-center') : null;
+        }
+    });
+    // END CLASSIC UI
+
+    let activeUi = null;
+    let komgaBasePath = '';
+
+    function getCurrentDetail() {
+        if (!activeUi) return null;
+
         const path = window.location.pathname;
-        const seriesMatch = path.match(/\/series\/([^\/]+)/);
-        if (seriesMatch) return seriesMatch[1];
+        if (!path.startsWith(komgaBasePath + '/')) return null;
 
-        const bookMatch = path.match(/\/book[s]?\/([^\/]+)/);
-        if (bookMatch) return bookMatch[1];
+        const match = activeUi.detailPath.exec(path.slice(komgaBasePath.length));
+        if (!match) return null;
 
-        return null;
+        try {
+            const id = decodeURIComponent(match[2]);
+            if (!id || id.includes('/')) return null;
+            return { type: match[1] === 'series' ? 'series' : 'book', id: id };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function isCurrentDetail(route) {
+        const current = getCurrentDetail();
+        return !!route && !!current && current.type === route.type && current.id === route.id;
+    }
+
+    function reloadDetail(route) {
+        if (isCurrentDetail(route)) window.location.reload();
     }
 
     function cleanSearchKeyword(title) {
@@ -503,10 +571,14 @@
 
     /**
      * 判断是否为 Komga 本地请求（需要携带认证 Cookie）
-     * Komga API 调用始终使用 window.location.origin，外部请求则指向其他域名
+     * Komga API 始终使用当前页面的同源地址。
      */
     function isLocalRequest(url) {
-        return url.startsWith(window.location.origin);
+        try {
+            return new URL(url).origin === window.location.origin;
+        } catch (_) {
+            return false;
+        }
     }
 
     /**
@@ -555,7 +627,7 @@
                 fetch: true,
                 onload: function(response) {
                     if (debug) {
-                        console.log('[KomgaScraper] Response status:', response.status, 
+                        console.log('[KomgaScraper] Response status:', response.status,
                                    'responseText length:', response.responseText ? response.responseText.length : 0);
                     }
 
@@ -623,23 +695,33 @@
     // 5. Komga API 模块
     // ============================================================
     // Komga API 文档： https://komga.org/docs/api/rest/
-    // 本脚本从 window.location.origin 动态取基础地址；
-    // 常用接口（便于 agent 直接调用测试，{origin} 替换为你的 Komga 站点）：
-    //   - 系列详情：  GET {origin}/api/v1/series/{seriesId}
-    //   - 书籍详情：  GET {origin}/api/v1/books/{bookId}
-    //   - 系列下书籍：GET {origin}/api/v1/series/{seriesId}/books?size=500
-    //   - 系列元数据：PATCH {origin}/api/v1/series/{seriesId}/metadata
-    //   - 书籍元数据：PATCH {origin}/api/v1/books/{bookId}/metadata
+    // API 和前端共用 Komga 提供的站点基础路径。
 
     function getKomgaBaseUrl() {
-        return window.location.origin;
+        return window.location.origin + komgaBasePath;
+    }
+
+    async function canReloadDetail(route) {
+        if (!isCurrentDetail(route)) return false;
+
+        try {
+            const response = await withTimeout(doGMRequest({
+                url: getKomgaBaseUrl() + '/api/v1/settings',
+                timeout: 3000
+            }), 3000, '读取 Komga 前端设置');
+            if (response.status !== 200 || !response.data || typeof response.data !== 'object') return false;
+
+            return activeUi.isDefault(response.data) && isCurrentDetail(route);
+        } catch (_) {
+            return false;
+        }
     }
 
     async function fetchSeriesData(seriesId) {
         try {
             const response = await doGMRequest({
                 method: 'GET',
-                url: getKomgaBaseUrl() + '/api/v1/series/' + seriesId,
+                url: getKomgaBaseUrl() + '/api/v1/series/' + encodeURIComponent(seriesId),
                 headers: {
                     'Accept': 'application/json'
                 }
@@ -659,7 +741,7 @@
         try {
             const response = await doGMRequest({
                 method: 'GET',
-                url: getKomgaBaseUrl() + '/api/v1/books/' + bookId,
+                url: getKomgaBaseUrl() + '/api/v1/books/' + encodeURIComponent(bookId),
                 headers: {
                     'Accept': 'application/json'
                 }
@@ -819,7 +901,7 @@
         try {
             const response = await doGMRequest({
                 method: 'PATCH',
-                url: getKomgaBaseUrl() + '/api/v1/series/' + seriesId + '/metadata',
+                url: getKomgaBaseUrl() + '/api/v1/series/' + encodeURIComponent(seriesId) + '/metadata',
                 headers: {
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
@@ -842,7 +924,7 @@
         try {
             const response = await doGMRequest({
                 method: 'PATCH',
-                url: getKomgaBaseUrl() + '/api/v1/books/' + bookId + '/metadata',
+                url: getKomgaBaseUrl() + '/api/v1/books/' + encodeURIComponent(bookId) + '/metadata',
                 headers: {
                     'Content-Type': 'application/json',
                     'Accept': 'application/json'
@@ -4047,91 +4129,39 @@
     // 8. UI 模块 - 按钮
     // ============================================================
 
-    const SCRAPE_BTN_ID = 'komga-scraper-btn-container';
-    const AUTO_SCRAPE_BTN_ID = 'komga-scraper-auto-btn-container';
+    const DETAIL_ACTIONS_ID = 'komga-scraper-actions';
 
-    function createScrapeButton() {
-        const container = document.createElement('div');
-        container.className = 'col col-auto';
-        container.id = SCRAPE_BTN_ID;
-
-        const button = document.createElement('a');
-        button.className = 'v-btn v-btn--is-elevated v-btn--has-bg theme--dark v-size--small';
-        button.title = '刮削元数据';
-        button.style.cursor = 'pointer';
-        button.style.textDecoration = 'none';
-
-        const content = document.createElement('span');
-        content.className = 'v-btn__content';
-
-        const icon = document.createElement('i');
-        icon.className = 'v-icon notranslate v-icon--left mdi mdi-database-search theme--dark';
-        icon.setAttribute('aria-hidden', 'true');
-        icon.style.fontSize = '16px';
-
-        content.appendChild(icon);
-        content.appendChild(document.createTextNode(' 刮削 '));
-        button.appendChild(content);
-
-        button.addEventListener('click', function(e) {
-            e.preventDefault();
-            showScraperSourceMenu();
-        });
-
-        container.appendChild(button);
-        return container;
+    function createDetailAction(label, title, onClick) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'ks-detail-action';
+        button.textContent = label;
+        button.title = title;
+        button.addEventListener('click', onClick);
+        return button;
     }
 
-    function createAutoScrapeButton() {
-        const container = document.createElement('div');
-        container.className = 'col col-auto';
-        container.id = AUTO_SCRAPE_BTN_ID;
+    function syncDetailActions(route, routeKey) {
+        const existing = document.getElementById(DETAIL_ACTIONS_ID);
+        const mount = route ? activeUi.findActionMount(route) : null;
+        if (existing && existing.parentElement === mount && existing.dataset.route === routeKey) return;
+        if (existing) existing.remove();
+        if (!mount) return;
 
-        const button = document.createElement('a');
-        button.className = 'v-btn v-btn--is-elevated v-btn--has-bg theme--dark v-size--small';
-        button.title = '自动刮削：按 Bangumi 系列中的卷号批量写入并锁定书籍元数据';
-        button.style.cursor = 'pointer';
-        button.style.textDecoration = 'none';
-
-        const content = document.createElement('span');
-        content.className = 'v-btn__content';
-
-        const icon = document.createElement('i');
-        icon.className = 'v-icon notranslate v-icon--left mdi mdi-auto-fix theme--dark';
-        icon.setAttribute('aria-hidden', 'true');
-        icon.style.fontSize = '16px';
-
-        content.appendChild(icon);
-        content.appendChild(document.createTextNode(' 自动刮削 '));
-        button.appendChild(content);
-
-        button.addEventListener('click', function(e) {
-            e.preventDefault();
-            startAutoScrape();
-        });
-
-        container.appendChild(button);
-        return container;
-    }
-
-    function injectScrapeButton() {
-        if (document.getElementById(SCRAPE_BTN_ID)) {
-            return;
+        const actions = document.createElement('div');
+        actions.className = 'ks-detail-actions';
+        if (activeUi.actionClass) actions.classList.add(...activeUi.actionClass.split(' '));
+        actions.id = DETAIL_ACTIONS_ID;
+        actions.dataset.route = routeKey;
+        actions.appendChild(createDetailAction('刮削', '刮削元数据', function() {
+            showScraperSourceMenu(route);
+        }));
+        if (route.type === 'series') {
+            actions.appendChild(createDetailAction('自动刮削', '按 Bangumi 卷号批量写入并锁定书籍元数据', function() {
+                startAutoScrape(route);
+            }));
         }
-
-        const pageType = getCurrentPageType();
-
-        const downloadBtn = document.querySelector('a.v-btn[title*="下载"]');
-
-        if (downloadBtn) {
-            const parentRow = downloadBtn.closest('.row.align-center');
-            if (parentRow) {
-                parentRow.appendChild(createScrapeButton());
-                if (pageType === 'series') {
-                    parentRow.appendChild(createAutoScrapeButton());
-                }
-            }
-        }
+        mount.appendChild(actions);
     }
 
     // ============================================================
@@ -4144,6 +4174,10 @@
         const style = document.createElement('style');
         style.id = 'ks-common-styles';
         style.textContent = [
+            '.ks-detail-actions { display:flex; flex-wrap:wrap; gap:8px; margin-block-start:8px; }',
+            '.ks-detail-action { border:0; border-radius:6px; min-height:34px; padding:4px 12px; cursor:pointer; font:inherit; font-size:14px; font-weight:500; color:#fff; color:rgb(var(--v-theme-on-primary)); background:#4f46a6; background:rgb(var(--v-theme-primary)); }',
+            '.ks-detail-action:hover { filter:brightness(1.12); }',
+            '.ks-detail-action:focus-visible { outline:2px solid #667eea; outline-offset:2px; }',
             '.ks-btn { border:none;padding:10px 20px;border-radius:8px;cursor:pointer;font-size:14px;transition:all 0.2s; }',
             '.ks-btn-primary { background:linear-gradient(135deg,#667eea 0%,#764ba2 100%);color:#fff;font-weight:500; }',
             '.ks-btn-primary:hover { transform: translateY(-1px); box-shadow:0 4px 12px rgba(102,126,234,0.4); }',
@@ -4271,15 +4305,17 @@
         };
     }
 
-    function showSuccess(fields, onRefresh) {
+    async function showSuccess(fields, route, fromKeywordEdit) {
+        const canReload = await canReloadDetail(route);
+        if (!isCurrentDetail(route)) return;
+
         closeAllModals();
         const config = getConfig();
-        // 来自手动修改搜索词的重试流程，不触发自动刷新
-        const fromKeywordEdit = window.__ks_fromKeywordEdit === true;
-        const shouldAutoRefresh = config.autoRefresh !== false && !fromKeywordEdit;
-        const autoRefreshMsg = shouldAutoRefresh
-            ? '页面将在 2 秒后自动刷新...'
-            : '自动刷新已关闭，可手动点击刷新按钮';
+        const shouldAutoRefresh = canReload && config.autoRefresh !== false && !fromKeywordEdit;
+        let refreshMessage = '当前详情由 Komga 实时更新。';
+        if (canReload) {
+            refreshMessage = shouldAutoRefresh ? '页面将在 2 秒后自动刷新。' : '可以手动刷新当前详情。';
+        }
         const contentHtml = `
             <div style="padding:10px 0;">
                 <div style="text-align:center;font-size:48px;margin-bottom:16px;">✅</div>
@@ -4290,33 +4326,27 @@
                         ${fields.map(function(f) { return '<span style="display:inline-block;background:rgba(76,175,80,0.2);color:#4caf50;padding:4px 10px;border-radius:6px;font-size:13px;margin:4px 4px 4px 0;">' + f + '</span>'; }).join('')}
                     </div>
                 ` : ''}
-                <div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;">${autoRefreshMsg}</div>
+                <div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;">${refreshMessage}</div>
                 <div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">
                     <button class="ks-btn ks-btn-secondary" id="ks-close-btn-2">关闭</button>
-                    <button class="ks-btn ks-btn-primary" id="ks-refresh-btn">立即刷新</button>
+                    ${canReload ? '<button class="ks-btn ks-btn-primary" id="ks-refresh-btn">立即刷新</button>' : ''}
                 </div>
             </div>
         `;
         const modal = createModalBase('成功', contentHtml, null);
 
-        document.getElementById('ks-close-btn-2').onclick = function() {
+        modal.querySelector('#ks-close-btn-2').onclick = function() {
             modal.remove();
         };
-        document.getElementById('ks-refresh-btn').onclick = function() {
+        const refresh = function() {
             modal.remove();
-            if (onRefresh) {
-                onRefresh();
-            } else {
-                window.location.reload();
-            }
+            reloadDetail(route);
         };
+        modal.querySelector('#ks-refresh-btn')?.addEventListener('click', refresh);
 
         if (shouldAutoRefresh) {
             setTimeout(function() {
-                if (document.body.contains(modal)) {
-                    modal.remove();
-                    window.location.reload();
-                }
+                if (modal.isConnected) refresh();
             }, 2000);
         }
     }
@@ -4325,13 +4355,14 @@
     // 10. 刮削源选择菜单
     // ============================================================
 
-    function showScraperSourceMenu() {
+    function showScraperSourceMenu(route) {
+        if (!isCurrentDetail(route)) return;
         closeAllModals();
 
         // 系列页：同人本基本是单本，系列信息更适合在书籍页刮削 —— 用浅红气泡提示
         //（气泡尺寸与 Bangumi 卡片的「推荐」徽标一致，仅换配色；不可点击，只作说明）。
         // 书籍页没有需要额外提示的内容，不显示任何徽标。
-        const doujinCardHint = getCurrentPageType() === 'series'
+        const doujinCardHint = route.type === 'series'
             ? '<span style="font-size:12px;background:rgba(244,67,54,0.18);color:#ff8a80;padding:4px 8px;border-radius:6px;text-align:right;line-height:1.4;max-width:62%;">同人本推荐在书籍中刮削而非本页面刮削</span>'
             : '';
 
@@ -4366,13 +4397,13 @@
         const bangumiCard = modal.querySelector('.ks-source-card[data-source="bangumi"]');
         bangumiCard.addEventListener('click', function() {
             modal.remove();
-            startScrapeProcess('bangumi');
+            startScrapeProcess('bangumi', route);
         });
 
         const fanzaCard = modal.querySelector('.ks-source-card[data-source="fanza"]');
         fanzaCard.addEventListener('click', function() {
             modal.remove();
-            startScrapeProcess('fanza');
+            startScrapeProcess('fanza', route);
         });
     }
 
@@ -4841,7 +4872,6 @@
                 return;
             }
             // 本次搜索所用词与打开弹窗时的关键词不同 → 沿用「改过词不自动刷新页面」的语义
-            if (reqKeyword !== keyword) window.__ks_fromKeywordEdit = true;
 
             // 每次有效点击都留一行日志（定位「点了没反应」）：关键词 + 该源缓存命中与否
             const cacheKey = reqKeyword + '\u0000' + key;
@@ -5536,8 +5566,6 @@
         document.getElementById('ks-confirm-btn').onclick = function() {
             const checkboxes = modal.querySelectorAll('.ks-field-checkbox');
             const selectedFields = {};
-            const updatedFields = [];
-            const fieldLabels = { title: '标题', titleSort: '排序标题', summary: '简介', status: '状态', number: '序号', numberSort: '排序序号', releaseDate: '发布日期', isbn: 'ISBN', pages: '页数', author: '作者', tags: '标签', readingDirection: '阅读方向', totalBookCount: '书籍总数', publisher: '出版社', language: '语言' };
 
             checkboxes.forEach(function(cb) {
                 const fieldKey = cb.getAttribute('data-field');
@@ -5545,7 +5573,6 @@
                     const input = modal.querySelector('.ks-field-input[data-field="' + fieldKey + '"]');
                     if (input) {
                         selectedFields[fieldKey] = input.value;
-                        updatedFields.push(fieldLabels[fieldKey] || fieldKey);
                     }
                 }
             });
@@ -5563,14 +5590,12 @@
                     });
                     if (collectedAuthors.length > 0) {
                         selectedFields.authors = collectedAuthors;
-                        updatedFields.push('作者');
                     }
                 }
             }
 
             if (hasLinks) {
                 selectedFields.links = scrapeResult.links;
-                updatedFields.push('来源链接');
             }
 
             if (hasTags) {
@@ -5583,7 +5608,6 @@
                             const tagList = rawTags.split(/[,，]/).map(function(t) { return t.trim(); }).filter(function(t) { return t && t.length > 0; });
                             if (tagList.length > 0) {
                                 selectedFields.tags = tagList;
-                                updatedFields.push('标签');
                             }
                         }
                     }
@@ -5597,7 +5621,6 @@
                     const rdValue = String(rdSelect.value || '').trim();
                     if (rdValue) {
                         selectedFields.readingDirection = rdValue;
-                        updatedFields.push('阅读方向');
                     }
                 }
 
@@ -5621,7 +5644,6 @@
                         }
                         if (altArr.length > 0) {
                             selectedFields.alternateTitles = altArr;
-                            updatedFields.push('别名');
                         }
                     }
                 }
@@ -5630,7 +5652,7 @@
             if (config.debug) console.log('[KomgaScraper] Selected fields for update:', selectedFields);
 
             modal.remove();
-            onConfirm(selectedFields, updatedFields);
+            onConfirm(selectedFields);
         };
     }
 
@@ -5868,31 +5890,21 @@
         return first;
     }
 
-    async function startScrapeProcess(source, overrideKeyword) {
+    async function startScrapeProcess(source, route, overrideKeyword) {
+        if (!isCurrentDetail(route)) return;
+
+        const { type: pageType, id: pageId } = route;
+        let fromKeywordEdit = !!overrideKeyword;
+        const doRetry = function(keyword) {
+            startScrapeProcess(source, route, keyword);
+        };
+
         // catch 里的「重试」入口要用到已清洗的关键词（如 DLsite / 駿河屋 拦截弹窗）：
         // 声明放 try 外，避免 try 内早期抛错时 catch 访问不到（ReferenceError → 错误弹窗永不出现）
         let cleanKeyword = '';
         try {
             const config = getConfig();
-            // 来自手动修改搜索词的重试流程，不触发自动刷新
-            if (overrideKeyword && overrideKeyword.length > 0) {
-                window.__ks_fromKeywordEdit = true;
-            } else {
-                window.__ks_fromKeywordEdit = false;
-            }
             if (config.debug) console.log('[KomgaScraper] Starting scrape process with source:', source, overrideKeyword ? ' / override keyword: ' + overrideKeyword : '');
-
-            const pageType = getCurrentPageType();
-            if (pageType !== 'series' && pageType !== 'book') {
-                showError('不支持的页面', '请在系列详情页或书籍详情页使用刮削功能');
-                return;
-            }
-
-            const pageId = extractIdFromUrl();
-            if (!pageId) {
-                showError('无法识别页面 ID', '请确认您在正确的页面上');
-                return;
-            }
 
             const loading = showLoading('正在获取页面信息...');
 
@@ -5903,6 +5915,10 @@
                 currentData = await fetchBookData(pageId);
             }
 
+            if (!isCurrentDetail(route)) {
+                loading.remove();
+                return;
+            }
             if (!currentData) {
                 loading.remove();
                 showError('获取 Komga 数据失败', '请检查网络连接或页面权限');
@@ -5964,10 +5980,6 @@
             const isDoujinSearch = source === 'fanza';
             const sourceLabel = isDoujinSearch ? '同人本搜索' : 'Bangumi';
             showLoading('正在搜索 ' + sourceLabel + ': ' + cleanKeyword);
-
-            const doRetry = function(newKeyword) {
-                startScrapeProcess(source, newKeyword);
-            };
 
             let searchResults = [];
             let searchTotalCount = null;
@@ -6058,10 +6070,11 @@
                     searchNotice = bangumiSearch.notice;
                 } catch (e) {
                     loading.remove();
+                    if (!isCurrentDetail(route)) return;
                     if (e && e.searchTimeout) {
                         const retryKeyword = cleanKeyword || '';
                         showError('搜索超时', e.message + '，请检查网络后重试', function() {
-                            startScrapeProcess(source, retryKeyword);
+                            doRetry(retryKeyword);
                         });
                         return;
                     }
@@ -6069,20 +6082,20 @@
                         const retryKeyword = cleanKeyword;
                         showError('Bangumi 搜索接口不可用', 'Bangumi 接口暂时无法访问（' + (e.message || '未知错误') +
                             '），通常是 Bangumi 源站问题，请稍后重试', function() {
-                            startScrapeProcess(source, retryKeyword);
+                            doRetry(retryKeyword);
                         });
                         return;
                     }
-                    showError('搜索请求失败', '请检查网络连接', function() {
-                        startScrapeProcess(source);
-                    });
+                    showError('搜索请求失败', '请检查网络连接', doRetry);
                     return;
                 }
             }
 
             loading.remove();
+            if (!isCurrentDetail(route)) return;
 
             const onSelectResult = async function(selectedResult) {
+                if (!isCurrentDetail(route)) return;
                 showLoading('正在获取详细数据...');
                 let detail = null;
                 const selectedSource = selectedResult && selectedResult.source ? selectedResult.source : source;
@@ -6093,7 +6106,9 @@
                     try {
                         const surugayaDetailHtml = await withTimeout(
                             fetchSurugayaDetail(selectedResult.url, getConfig().debug, function() {
-                                showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证（请在 40 秒内完成验证），脚本会自动继续');
+                                if (isCurrentDetail(route)) {
+                                    showLoading('駿河屋 需要人机验证：请切到刚打开的 駿河屋 标签页完成验证（请在 40 秒内完成验证），脚本会自动继续');
+                                }
                             }),
                             surugayaSourceBudgetMs(),
                             '駿河屋 详情'
@@ -6136,27 +6151,10 @@
                 if (pageType === 'book' && isDoujinSearch && currentData && currentData.seriesId) {
                     seriesData = await fetchSeriesData(currentData.seriesId);
                 }
-                closeAllModals();
+                if (!isCurrentDetail(route)) return;
 
-                if (!detail) {
-                    showError('获取详情失败', '无法获取详细数据，将使用搜索结果');
-                    showMetadataPreview(selectedResult, currentData, pageType, selectedSource, function(selectedFields, updatedFields) {
-                        if (Object.keys(selectedFields).length === 0) {
-                            showError('未选择任何字段', '请至少勾选一个要更新的字段');
-                            return;
-                        }
-                        writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData, seriesData);
-                    }, seriesData);
-                    return;
-                }
-
-                showMetadataPreview(detail, currentData, pageType, selectedSource, function(selectedFields, updatedFields) {
-                    if (Object.keys(selectedFields).length === 0) {
-                        showError('未选择任何字段', '请至少勾选一个要更新的字段');
-                        return;
-                    }
-
-                    writeMetadataToKomga(pageType, pageId, selectedFields, updatedFields, currentData, seriesData);
+                showMetadataPreview(detail || selectedResult, currentData, pageType, selectedSource, function(selectedFields) {
+                    writeManualMetadata(route, selectedFields, currentData, seriesData, fromKeywordEdit);
                 }, seriesData);
             };
 
@@ -6192,6 +6190,7 @@
                     const target = DOUJIN_SEARCH_SOURCES.filter(function(src) { return src.key === key; })[0];
                     if (!target) throw new Error('未知的同人本搜索源：' + key);
                     const usedKeyword = (keywordOverride && keywordOverride.length > 0) ? keywordOverride : cleanKeyword;
+                    if (usedKeyword !== cleanKeyword) fromKeywordEdit = true;
                     // 弹窗手动搜索：駿河屋 等桥接不受单源超时掐断；其余源 0 命中时自动换字形重试
                     const page = await searchDoujinSourceWithVariants(target, usedKeyword, { manual: true });
                     return { results: (page && page.results) || [], total: page && page.total };
@@ -6203,19 +6202,20 @@
 
         } catch (e) {
             console.error('[KomgaScraper] Scrape process failed:', e);
+            if (!isCurrentDetail(route)) return;
             // 防御性兜底：同人本链路的源错误现在直接在结果弹窗的手动模式提示行里展示，
             // 这里保留对带标记错误的兜底文案（其它流程仍可能抛出）
             if (e && e.dlsiteBlocked) {
                 const retryKeyword = cleanKeyword || '';
                 showError('无法访问 DLsite', describeDlsiteBlocked(e.dlsiteBlocked), function() {
-                    startScrapeProcess(source, retryKeyword);
+                    doRetry(retryKeyword);
                 });
                 return;
             }
             if (e && e.surugayaBlocked) {
                 const retryKeyword = cleanKeyword || '';
                 showError('无法访问 駿河屋', describeSurugayaBlocked(e.surugayaBlocked), function() {
-                    startScrapeProcess(source, retryKeyword);
+                    doRetry(retryKeyword);
                 });
                 return;
             }
@@ -6223,14 +6223,14 @@
                 const retryKeyword = cleanKeyword || '';
                 const service = e.fanzaService || 'FANZA/DMM';
                 showError('无法访问 ' + service, describeFanzaBlocked(e.fanzaBlocked, e.fanzaService), function() {
-                    startScrapeProcess(source, retryKeyword);
+                    doRetry(retryKeyword);
                 });
                 return;
             }
             if (e && e.searchTimeout) {
                 const retryKeyword = cleanKeyword || '';
                 showError('搜索超时', e.message + '，请检查网络后重试', function() {
-                    startScrapeProcess(source, retryKeyword);
+                    doRetry(retryKeyword);
                 });
                 return;
             }
@@ -6238,7 +6238,25 @@
         }
     }
 
-    async function writeMetadataToKomga(pageType, pageId, metadata, updatedFields, currentData, seriesData) {
+    async function writeManualMetadata(route, metadata, currentData, seriesData, fromKeywordEdit) {
+        if (!isCurrentDetail(route)) return;
+        if (Object.keys(metadata).length === 0) {
+            showError('未选择任何字段', '请至少勾选一个要更新的字段');
+            return;
+        }
+
+        showLoading('正在写入元数据到 Komga...');
+        const result = await writeMetadataToKomga(route.type, route.id, metadata, currentData, seriesData);
+        if (!isCurrentDetail(route)) return;
+
+        if (result.success) {
+            await showSuccess(result.fields, route, fromKeywordEdit);
+        } else {
+            showError(result.message, result.detail);
+        }
+    }
+
+    async function writeMetadataToKomga(pageType, pageId, metadata, currentData, seriesData) {
         try {
             const config = getConfig();
 
@@ -6551,8 +6569,7 @@
             }
 
             if (Object.keys(finalMetadata).length === 0 && Object.keys(seriesPayload).length === 0) {
-                showError('无可用字段', '所有勾选的字段都包含无效值，无法写入');
-                return;
+                return { success: false, message: '无可用字段', detail: '所有勾选的字段都包含无效值，无法写入' };
             }
 
             if (config.debug) {
@@ -6561,8 +6578,6 @@
                     console.log('[KomgaScraper] Writing series metadata to Komga:', seriesId, JSON.stringify(seriesPayload, null, 2));
                 }
             }
-
-            showLoading('正在写入元数据到 Komga...');
 
             let success = true;
             let failureDetail = '';
@@ -6596,16 +6611,13 @@
 
             if (success) {
                 if (config.debug) console.log('[KomgaScraper] Metadata updated successfully');
-                showSuccess(finalUpdated, function() {
-                    window.location.reload();
-                });
-            } else {
-                showError('写入元数据失败', failureDetail || '请检查 API Key 或页面权限设置');
+                return { success: true, fields: finalUpdated };
             }
+            return { success: false, message: '写入元数据失败', detail: failureDetail || '请检查 API Key 或页面权限设置' };
 
         } catch (e) {
             console.error('[KomgaScraper] Failed to write metadata:', e);
-            showError('写入元数据失败', e.message || '请查看浏览器控制台获取详细信息');
+            return { success: false, message: '写入元数据失败', detail: e.message || '请查看浏览器控制台获取详细信息' };
         }
     }
 
@@ -6695,8 +6707,8 @@
             }
 
             // 直接调用已有的写回逻辑：传入 currentMetadata={} 以强制所有值以 bangumi 为来源
-            await writeMetadataToKomga('book', bookId, mapped, null, { metadata: {} });
-            return true;
+            const result = await writeMetadataToKomga('book', bookId, mapped, { metadata: {} });
+            return result.success;
         } catch (e) {
             console.error('[KomgaScraper] [Auto] Failed to write metadata for book', bookId, e);
             return false;
@@ -6718,8 +6730,9 @@
         } catch (_) { /* ignore */ }
     }
 
-    function showAutoScrapeResultSummary(successCount, skippedCount, failedCount, total) {
+    async function showAutoScrapeResultSummary(successCount, skippedCount, failedCount, total, route) {
         try {
+            const canReload = await canReloadDetail(route);
             closeAllModals();
             const contentHtml =
                 '<div style="padding:10px 0;">' +
@@ -6736,12 +6749,15 @@
                     '<div style="color:rgba(255,255,255,0.5);font-size:13px;text-align:center;margin-bottom:16px;">所有写入字段已在 Komga 中加锁，避免被内部扫描覆盖。</div>' +
                     '<div style="display:flex;gap:10px;justify-content:center;margin-top:20px;">' +
                         '<button class="ks-btn ks-btn-secondary" id="ks-auto-close">关闭</button>' +
-                        '<button class="ks-btn ks-btn-primary" id="ks-auto-refresh">刷新页面</button>' +
+                        (canReload ? '<button class="ks-btn ks-btn-primary" id="ks-auto-refresh">刷新页面</button>' : '') +
                     '</div>' +
                 '</div>';
             const modal = createModalBase('自动刮削完成', contentHtml, null);
-            document.getElementById('ks-auto-close').onclick = function() { modal.remove(); };
-            document.getElementById('ks-auto-refresh').onclick = function() { modal.remove(); window.location.reload(); };
+            modal.querySelector('#ks-auto-close').onclick = function() { modal.remove(); };
+            modal.querySelector('#ks-auto-refresh')?.addEventListener('click', function() {
+                modal.remove();
+                reloadDetail(route);
+            });
         } catch (e) {
             console.error('[KomgaScraper] [Auto] Failed to render summary modal:', e);
             alert('自动刮削完成。成功 ' + successCount + ' / 跳过 ' + skippedCount + ' / 失败 ' + failedCount + ' / 总计 ' + total);
@@ -7166,29 +7182,21 @@
         render();
     }
 
-    async function startAutoScrape() {
+    async function startAutoScrape(route) {
         // 自动刮削仅支持 Bangumi 源。「同人本搜索」链路（FANZAブックス / DLsite / FANZA同人 / 駿河屋）
         // 主要是同人本 / 単話，命名不规范、数量通常较少，不提供自动刮削功能；
         // 需要抓取这些源时请使用页面上的“刮削”按钮手动执行。
+        if (!isCurrentDetail(route) || route.type !== 'series') return;
+
         try {
             closeAllModals();
             const config = getConfig();
             const debug = config.debug;
-
-            const pageType = getCurrentPageType();
-            if (pageType !== 'series') {
-                showError('无法自动刮削', '请在系列详情页使用自动刮削功能');
-                return;
-            }
-
-            const seriesId = extractIdFromUrl();
-            if (!seriesId) {
-                showError('无法识别系列 ID', '请确认您在正确的系列页面');
-                return;
-            }
+            const seriesId = route.id;
 
             showLoading('正在读取 Komga 系列信息...');
             const seriesData = await fetchSeriesData(seriesId);
+            if (!isCurrentDetail(route)) return;
             if (!seriesData) {
                 closeAllModals();
                 showError('读取系列信息失败', '请检查网络或页面权限');
@@ -7206,6 +7214,7 @@
 
             showLoading('正在读取 Komga 书籍列表...');
             const komgaBooks = await fetchBooksOfSeries(seriesId);
+            if (!isCurrentDetail(route)) return;
             if (!komgaBooks || komgaBooks.length === 0) {
                 closeAllModals();
                 showError('该系列下没有书籍', '当前系列没有可写入的书籍条目');
@@ -7217,12 +7226,14 @@
             try {
                 bangumiSubjectsRaw = await fetchBangumiSubjectsOfSeries(bangumiSubjectId);
             } catch (e) {
+                if (!isCurrentDetail(route)) return;
                 closeAllModals();
                 console.error('[KomgaScraper] [Auto] Bangumi relations unavailable:', e);
                 showError('Bangumi 接口不可用', '无法读取该系列在 Bangumi 上的子条目（' +
                     (e && e.message ? e.message : '未知错误') + '）；这通常是 Bangumi 源站问题，请稍后重试');
                 return;
             }
+            if (!isCurrentDetail(route)) return;
             // 该系列在 Bangumi 下一条书籍关系都没有时不再中断：照常打开确认弹窗、全部标未匹配，
             // 用户至少能看到每本书失败的原因（此时候选列表为空，手动指定面板会是空的）。
             const bangumiBooks = bangumiSubjectsRaw.map(function(b) {
@@ -7253,12 +7264,14 @@
 
             // 弹出确认框（含逐本映射预览），用户确认后再开始逐本刮削
             showAutoScrapeConfirm(seriesTitle, pairs, bangumiBooks, function(selectedPairs) {
-                runAutoScrapeLoop(selectedPairs, total);
+                if (isCurrentDetail(route)) runAutoScrapeLoop(selectedPairs, total);
             });
 
         } catch (e) {
             console.error('[KomgaScraper] [Auto] Auto scrape failed:', e);
-            showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
+            if (isCurrentDetail(route)) {
+                showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
+            }
         }
 
         // selectedPairs：确认弹窗里勾选的书籍（只有匹配到 Bangumi 条目、且用户没取消的书）；
@@ -7281,11 +7294,13 @@
                     const pair = pairs[i];
                     if (!pair.bangumiBook) {
                         skippedCount++;
-                        updateLoadingProgress(i + 1, total, '自动刮削中');
+                        if (isCurrentDetail(route)) updateLoadingProgress(i + 1, total, '自动刮削中');
                         continue;
                     }
 
-                    updateLoadingProgress(i + 1, total, '正在处理第 ' + String(i + 1) + ' 本');
+                    if (isCurrentDetail(route)) {
+                        updateLoadingProgress(i + 1, total, '正在处理第 ' + String(i + 1) + ' 本');
+                    }
 
                     let detail = lastFetchedDetailById[pair.bangumiBook.id];
                     if (!detail) {
@@ -7318,7 +7333,7 @@
 
                 // 完成汇总：「跳过」= 未匹配 + 手动取消 + 循环内跳过，保证 成功 + 跳过 + 失败 = 系列书籍总数
                 skippedCount = Math.max(0, Number(allBooksCount) - successCount - failedCount);
-                showAutoScrapeResultSummary(successCount, skippedCount, failedCount, allBooksCount);
+                await showAutoScrapeResultSummary(successCount, skippedCount, failedCount, allBooksCount, route);
             } catch (e) {
                 console.error('[KomgaScraper] [Auto] Auto scrape loop failed:', e);
                 showError('自动刮削过程中发生错误', e.message || '请查看浏览器控制台获取详细信息');
@@ -7338,10 +7353,10 @@
             }
 
             if (e.ctrlKey && e.shiftKey && e.key === 'S') {
-                e.preventDefault();
-                const pageType = getCurrentPageType();
-                if (pageType === 'series' || pageType === 'book') {
-                    showScraperSourceMenu();
+                const route = getCurrentDetail();
+                if (route) {
+                    e.preventDefault();
+                    showScraperSourceMenu(route);
                 }
             }
 
@@ -7361,6 +7376,10 @@
     // ============================================================
 
     function init() {
+        activeUi = komgaUiAdapters.find(function(adapter) { return adapter.matches(); });
+        if (!activeUi || document.getElementById('ks-common-styles')) return;
+
+        komgaBasePath = getKomgaBasePath();
         checkConfigVersion();
         injectCommonStyles();
         registerShortcuts();
@@ -7374,16 +7393,26 @@
         }
 
         const config = getConfig();
-        if (config.debug) console.log('[KomgaScraper] Initializing scraper v' + SCRIPT_VERSION);
+        if (config.debug) console.log('[KomgaScraper] Initializing v' + SCRIPT_VERSION, activeUi.name);
 
-        const observer = new MutationObserver(function() {
-            const pageType = getCurrentPageType();
-            if (pageType === 'series' || pageType === 'book') {
-                injectScrapeButton();
-            }
-        });
+        let frame = null;
+        let previousRouteKey = '';
+        function scheduleActionSync() {
+            if (frame !== null) return;
+            frame = window.requestAnimationFrame(function() {
+                frame = null;
+                const route = getCurrentDetail();
+                const routeKey = route ? route.type + '/' + route.id : '';
+                if (previousRouteKey && previousRouteKey !== routeKey) closeAllModals();
+                previousRouteKey = routeKey;
+                syncDetailActions(route, routeKey);
+            });
+        }
 
+        const observer = new MutationObserver(scheduleActionSync);
         observer.observe(document.body, { childList: true, subtree: true });
+        window.addEventListener('popstate', scheduleActionSync);
+        scheduleActionSync();
 
         if (config.debug) console.log('[KomgaScraper] Scraper initialized and ready');
     }

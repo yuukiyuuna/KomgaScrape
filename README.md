@@ -2,7 +2,7 @@
 
 一个用于 [Komga](https://komga.org/) 的用户脚本（Userscript），可以从外部数据源抓取漫画 / 书籍的元数据，并写回 Komga。
 
-当前版本：**v1.2.17**
+当前版本 **v2.0.0**
 
 ## 功能概览
 
@@ -20,13 +20,19 @@
 
 ## 安装
 
+| 脚本 | 支持的前端 |
+| --- | --- |
+| [双前端版](./komga-metadata-scraper.user.js) | Next UI 和 Classic UI |
+| [Next UI 专用版](./komga-metadata-scraper-next.user.js) | Next UI |
+
+同一个 Komga 实例选装一份即可。现有用户可升级双前端版并沿用原有脚本设置。Next UI 专用版单独保存设置。旧版脚本归档在 `codex/legacy-ui`。
+
 1. 在浏览器中安装一个 Userscript 管理器，例如：
    - [Tampermonkey](https://www.tampermonkey.net/)（Chrome / Edge / Firefox）。
    - [Violentmonkey](https://violentmonkey.github.io/)（开源推荐）。
-2. 把本仓库中的 [`komga-metadata-scraper.user.js`](./komga-metadata-scraper.user.js) 内容复制到管理器新建的脚本中，或通过 “从 URL 安装” 加载。
-3. **重要：** 打开脚本、把顶部 `// @match {你自己的komga网站地址}` 替换为你自己的 Komga 地址（例如 `https://komga.example.com/*` 或 `http://192.168.0.10:25600/*`）。
-
-4. 保存脚本，刷新 Komga 页面即可看到 “刮削” / “自动刮削” 按钮。
+2. 把选定的脚本复制到管理器新建的脚本中，或通过「从 URL 安装」加载。
+3. 在脚本顶部为自己的 Komga 添加一行 `@match`，例如 `// @match https://komga.example.com/*`。部署在子路径时可以填 `// @match https://komga.example.com/komga/*`。
+4. 保存脚本，刷新 Komga 后进入系列或书籍详情页，在操作区找到「刮削」按钮。
 
 > **Tampermonkey 用户请注意：** 脚本中的 `駿河屋` 兜底源需要 `GM_cookie`（复用浏览器里已通过的 Cloudflare 校验 Cookie）以及 `GM_openInTab` / `GM_addValueChangeListener`（被 Cloudflare 拦下时改用「桥接标签页」重取）权限，`@match` 里带有 `https://www.suruga-ya.jp/*`。更新脚本后管理器会提示权限变化，请点击允许；否则 `駿河屋` 直连被拦时无法自动改用桥接标签页。（v1.2.13 起已移除 `https://www.dlsite.com/*` 的 `@match`：DLsite 不再使用桥接标签页。）
 
@@ -36,12 +42,14 @@
 
 ### 1. 手动刮削
 
-1. 打开一个**系列**或**书籍**详情页，点击右上角 “刮削”。
+1. 打开一个**系列**或**书籍**详情页，在操作区点击「刮削」。
 2. 在弹出菜单中选择数据源（Bangumi 或「同人本搜索」）。
 3. 确认搜索结果，脚本会自动填充标题、简介、出版日期、ISBN、作者、标签等字段。
 4. 点击“写入”后，字段会被写回 Komga，并自动在 Komga 侧锁定（`*Lock=true`），防止被 Komga 内置的元数据扫描覆盖。
 
 > 书籍页的搜索关键词与预览里的「序号 / 排序序号」默认值同样取自**文件名解析出的卷号**（解析不到才用 Komga 当前值），避免 Komga 按位置重编号后搜错卷。
+
+临时切换 Komga 前端时，写入后由当前界面实时更新详情。实时连接不可用时，可以从当前界面的列表重新打开详情。使用服务器默认界面时，可在脚本设置里选择写入后自动刷新。
 
 ### 2. 自动刮削（仅 Bangumi，仅限系列页）
 
@@ -212,7 +220,7 @@ Bangumi 的 v0 接口（`api.bgm.tv/v0/...`）偶尔会整段不可用（例如�
 
 - **浏览器：** 现代浏览器（Chrome / Edge / Firefox / Safari 最新一两个版本）。
 - **Userscript 管理器：** 必须支持 `GM_xmlhttpRequest` / `GM_setValue` / `GM_getValue` / `GM_registerMenuCommand`。
-- **Komga 版本：** 任何暴露 `/api/v1/series/{id}`、`/api/v1/books/{id}`、以及对应 `PATCH /metadata` 接口的版本。
+- **Komga** 已在 1.29.0 和 1.30.1 验证详情页入口。刮削依赖 `/api/v1/series/{id}`、`/api/v1/books/{id}` 及其 `PATCH /metadata` 接口。
 - **Bangumi API：** 使用官方 `https://api.bgm.tv/v0/...`，无需鉴权（公开数据）；脚本在请求头中使用 `User-Agent: KomgaMetadataScraper/{版本号}` 标注自身。
 
 ## 注意事项
@@ -224,6 +232,11 @@ Bangumi 的 v0 接口（`api.bgm.tv/v0/...`）偶尔会整段不可用（例如�
 - 駿河屋 全站都有 Cloudflare 人机校验（商品详情页必拦，搜索列表页在本机 IP 被判可疑时也会拦）。搜索用列表页数据，**v1.2.15 起选中结果后会自动补抓商品详情页**（补全作者与简介；详情页同样靠「桥接标签页」重取，失败静默退回列表页数据）。若直连与桥接都失败，可只让 `suruga-ya.jp` 走代理换出口 IP 后重试。DLsite 已不再使用桥接标签页：直连失败时请让 `www.dlsite.com` 走代理后重试（脚本不内置代理）。
 
 ## 更新日志
+
+### v2.0.0
+
+- 增加 Next UI 入口，同时提供双前端版和 Next UI 专用版。两份脚本共用刮削逻辑，维护和同步命令见 [AGENT.md](./AGENT.md)。
+- 批量刮削逐本记录写入结果，结束后统一显示成功、跳过和失败数量。
 
 ### v1.2.17
 
