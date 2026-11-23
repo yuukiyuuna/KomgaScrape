@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Komga Metadata Scraper (Next UI)
 // @namespace    https://github.com/yourname/komga-scraper
-// @version      2.0.0
+// @version      1.5.0
 // @description  Komga 漫画/书籍元数据刮削。适用于 Next UI，支持 Bangumi 和同人本手动刮削，以及 Bangumi 系列自动刮削。
 // @author       Hancl
 // @match        https://www.suruga-ya.jp/*
